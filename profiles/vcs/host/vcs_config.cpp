@@ -1,6 +1,7 @@
 #include "vcs_config.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cerrno>
@@ -580,6 +581,11 @@ void set_environment_value(const char *name, const std::string &value) {
 
 } // namespace
 
+namespace {
+std::atomic<std::uint32_t> host_display_width{};
+std::atomic<std::uint32_t> host_display_height{};
+} // namespace
+
 DisplaySurfaceDimensions resolve_display_surface_dimensions(
     const DisplayConfiguration &configuration) noexcept {
     switch (configuration.resolution_mode) {
@@ -593,6 +599,11 @@ DisplaySurfaceDimensions resolve_display_surface_dimensions(
         return {static_cast<std::uint32_t>(std::max(320, GetSystemMetrics(SM_CXSCREEN))),
                 static_cast<std::uint32_t>(std::max(180, GetSystemMetrics(SM_CYSCREEN)))};
 #else
+        // Android: the panel reported by the activity/surface, full size.
+        if (const std::uint32_t w = host_display_width.load(std::memory_order_relaxed),
+                h = host_display_height.load(std::memory_order_relaxed);
+            w != 0u && h != 0u)
+            return {w, h};
         return {std::clamp(configuration.custom_width, 320u, 16384u),
                 std::clamp(configuration.custom_height, 180u, 16384u)};
 #endif
@@ -649,6 +660,18 @@ PresentationRectangle calculate_presentation_rectangle(
     return {width, height};
 }
 
+
+void set_host_display_size(std::uint32_t width, std::uint32_t height) noexcept {
+    // Keep the largest seen: a surface can come back smaller mid-resize, and
+    // the panel's real size is what "native" means.
+    if (width == 0u || height == 0u) return;
+    if (width < height) std::swap(width, height);  // the game always runs landscape
+    if (width > host_display_width.load(std::memory_order_relaxed)) {
+        host_display_width.store(width, std::memory_order_relaxed);
+        host_display_height.store(height, std::memory_order_relaxed);
+    }
+}
+
 InternalResolutionDimensions resolve_internal_resolution(
     const RenderingConfiguration &configuration) noexcept {
     switch (configuration.internal_resolution_mode) {
@@ -669,6 +692,14 @@ InternalResolutionDimensions resolve_internal_resolution(
         return {static_cast<std::uint32_t>(std::max(480, GetSystemMetrics(SM_CXSCREEN))),
                 static_cast<std::uint32_t>(std::max(272, GetSystemMetrics(SM_CYSCREEN)))};
 #else
+        // Android: the phone panel, fitted to the PSP's aspect. The picture is
+        // pillarboxed on a 19.5:9 screen anyway, so rendering the full panel
+        // width would only draw pixels that are cropped - native here means
+        // the panel's full height (e.g. 1906x1080 on a 2340x1080 display).
+        if (const std::uint32_t w = host_display_width.load(std::memory_order_relaxed),
+                h = host_display_height.load(std::memory_order_relaxed);
+            w != 0u && h != 0u)
+            return fit_psp_aspect(w, h);
         // Headless/non-Windows builds cannot query a monitor here. Custom
         // values provide a deterministic fallback for CI and proof tooling.
         return {std::clamp(configuration.internal_width, 480u, 16384u),

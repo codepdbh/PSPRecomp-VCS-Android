@@ -1,12 +1,10 @@
 package com.psprecomp.vcs;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
-import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.Paint;
 import android.graphics.PixelFormat;
-import android.graphics.PointF;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -14,8 +12,8 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.util.DisplayMetrics;
 import android.view.Gravity;
-import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -25,28 +23,31 @@ import android.widget.FrameLayout;
 import android.widget.TextView;
 
 import java.io.File;
-import java.util.HashMap;
-import java.util.Map;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 
 public final class MainActivity extends Activity implements SurfaceHolder.Callback {
-    private static final int PSP_SELECT = 0x001, PSP_START = 0x008;
-    private static final int PSP_UP = 0x010, PSP_RIGHT = 0x020, PSP_DOWN = 0x040, PSP_LEFT = 0x080;
-    private static final int PSP_L = 0x100, PSP_R = 0x200;
-    private static final int PSP_TRIANGLE = 0x1000, PSP_CIRCLE = 0x2000;
-    private static final int PSP_CROSS = 0x4000, PSP_SQUARE = 0x8000;
-
     static { System.loadLibrary("vcs_android"); }
     private static native String nativeStatus();
     private static native void nativeSetSurface(Surface surface);
+    private static native void nativeSetDisplaySize(int width, int height);
     private static native void nativeSetInput(int buttons, int analogX, int analogY,
                                               boolean accelerate, boolean brake);
     private static native void nativeStartGame(String gameRoot, String appDataDirectory);
     private static native void nativeStopGame();
 
+    private static final String CONFIG_FILE = "VCSNative.ini";
+
     private SurfaceView surfaceView;
+    private TouchControlsView controls;
     private TextView statusView;
     private boolean surfaceReady, startRequested, permissionPrompted;
     private long gameStartAt;
+    private int panelWidth, panelHeight;
     private final Handler handler = new Handler();
     private final Runnable statusPoll = new Runnable() {
         @Override public void run() {
@@ -64,11 +65,20 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        getWindow().getDecorView().setSystemUiVisibility(
-            View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
-            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
-            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
-        setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            // Draw under the camera cutout too; the controls steer clear of it themselves.
+            getWindow().getAttributes().layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        }
+        hideSystemBars();
+        setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+
+        // The panel's real size, landscape, for InternalResolutionMode=Desktop ("native").
+        DisplayMetrics metrics = new DisplayMetrics();
+        getWindowManager().getDefaultDisplay().getRealMetrics(metrics);
+        panelWidth = Math.max(metrics.widthPixels, metrics.heightPixels);
+        panelHeight = Math.min(metrics.widthPixels, metrics.heightPixels);
+        nativeSetDisplaySize(panelWidth, panelHeight);
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
@@ -78,9 +88,20 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         root.addView(surfaceView, new FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.CENTER));
 
-        TouchOverlay controls = new TouchOverlay();
+        controls = new TouchControlsView(this, new TouchControlsView.Listener() {
+            @Override public void onInput(int buttons, int analogX, int analogY,
+                                          boolean accelerate, boolean brake) {
+                nativeSetInput(buttons, analogX, analogY, accelerate, brake);
+            }
+            @Override public void onSettingsRequested() {
+                showSettingsDialog();
+            }
+            @Override public void onEditModeChanged(boolean editing) {
+                if (editing) statusView.setVisibility(View.GONE);
+            }
+        });
         root.addView(controls, new FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.CENTER));
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
         statusView = new TextView(this);
         statusView.setTextColor(Color.WHITE);
@@ -88,16 +109,43 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         statusView.setPadding(18, 10, 18, 10);
         statusView.setBackgroundColor(0x99000000);
         statusView.setMaxLines(2);
-        root.addView(statusView, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams statusParams = new FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP | Gravity.CENTER_HORIZONTAL));
+            Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        root.addView(statusView, statusParams);
         setContentView(root);
         handler.post(statusPoll);
+    }
+
+    private void hideSystemBars() {
+        getWindow().getDecorView().setSystemUiVisibility(
+            View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
+            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+    }
+
+    @Override public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) hideSystemBars();
     }
 
     @Override protected void onResume() {
         super.onResume();
         maybeStartGame();
+    }
+
+    @Override public void onBackPressed() {
+        if (controls != null && controls.isEditing()) {
+            controls.setEditMode(false);
+            return;
+        }
+        super.onBackPressed();
+    }
+
+    @Override protected void onPause() {
+        // Nothing may stay held while the app is in the background.
+        if (controls != null) controls.releaseAll();
+        super.onPause();
     }
 
     private void maybeStartGame() {
@@ -126,6 +174,182 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         nativeStartGame(gameRoot.getAbsolutePath(), getFilesDir().getAbsolutePath());
     }
 
+    // --- Resolution ------------------------------------------------------------------------
+
+    /** One choice in the resolution dialog: its label and the [Rendering] keys it writes. */
+    private static final class ResolutionChoice {
+        final String label, mode;
+        final int scale;
+        ResolutionChoice(String label, String mode, int scale) {
+            this.label = label; this.mode = mode; this.scale = scale;
+        }
+    }
+
+    /** Width the renderer actually uses at this height: widescreen fills the panel's shape. */
+    private int widescreenWidth(int height) {
+        return panelHeight > 0 ? Math.round(height * (float) panelWidth / panelHeight) : height * 480 / 272;
+    }
+
+    private List<ResolutionChoice> resolutionChoices() {
+        List<ResolutionChoice> choices = new ArrayList<>();
+        choices.add(new ResolutionChoice(String.format(Locale.ROOT, "HD — %d×816", widescreenWidth(816)),
+            "Scale", 3));
+        choices.add(new ResolutionChoice(String.format(Locale.ROOT, "Full HD — %d×1088", widescreenWidth(1088)),
+            "Scale", 4));
+        choices.add(new ResolutionChoice(String.format(Locale.ROOT,
+            "Nativa de la pantalla — %d×%d", panelWidth, panelHeight), "Desktop", 0));
+        return choices;
+    }
+
+    private void showSettingsDialog() {
+        controls.releaseAll();
+        String[] items = {"Resolución interna…", "Editar posición de controles", "Restablecer controles"};
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Ajustes")
+            .setItems(items, (dialog, which) -> {
+                if (which == 0) showResolutionDialog();
+                else if (which == 1) controls.setEditMode(true);
+                else controls.resetLayout();
+            })
+            .setNegativeButton("Cerrar", null)
+            .setOnDismissListener(d -> hideSystemBars())
+            .show();
+    }
+
+    private void showResolutionDialog() {
+        controls.releaseAll();
+        List<ResolutionChoice> choices = resolutionChoices();
+        String[] labels = new String[choices.size()];
+        for (int i = 0; i < labels.length; ++i) labels[i] = choices.get(i).label;
+        int current = currentResolutionIndex(choices);
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Resolución interna")
+            .setSingleChoiceItems(labels, current, (dialog, which) -> {
+                dialog.dismiss();
+                if (which == current) return;
+                if (!writeResolution(choices.get(which))) {
+                    statusView.setVisibility(View.VISIBLE);
+                    statusView.setText("No se pudo guardar la resolución.");
+                    return;
+                }
+                confirmRestart();
+            })
+            .setNegativeButton("Cancelar", null)
+            .setOnDismissListener(d -> hideSystemBars())
+            .show();
+    }
+
+    private void confirmRestart() {
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Reiniciar para aplicar")
+            .setMessage("La nueva resolución se aplica al reiniciar el juego. "
+                + "Se pierde lo que no hayas guardado.")
+            .setPositiveButton("Reiniciar ahora", (d, w) -> restartApp())
+            .setNegativeButton("Más tarde", null)
+            .setOnDismissListener(d -> hideSystemBars())
+            .show();
+    }
+
+    private void restartApp() {
+        Intent launch = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        if (launch == null) return;
+        Intent restart = Intent.makeRestartActivityTask(launch.getComponent());
+        startActivity(restart);
+        // The renderer is configured once per process; a fresh one picks up the new size.
+        Runtime.getRuntime().exit(0);
+    }
+
+    private File configFile() {
+        return new File(getFilesDir(), CONFIG_FILE);
+    }
+
+    private List<String> readConfig() {
+        try {
+            File file = configFile();
+            if (file.isFile()) return new ArrayList<>(Files.readAllLines(file.toPath(), StandardCharsets.UTF_8));
+        } catch (IOException ignored) {
+        }
+        return new ArrayList<>();
+    }
+
+    private static String keyOf(String line) {
+        int eq = line.indexOf('=');
+        return eq < 0 ? "" : line.substring(0, eq).trim().toLowerCase(Locale.ROOT);
+    }
+
+    private static String valueOf(String line) {
+        int eq = line.indexOf('=');
+        return eq < 0 ? "" : line.substring(eq + 1).trim();
+    }
+
+    private int currentResolutionIndex(List<ResolutionChoice> choices) {
+        String mode = "scale";
+        int scale = 3; // the Android default, see RenderingConfiguration
+        boolean inRendering = false;
+        for (String raw : readConfig()) {
+            String line = raw.trim();
+            if (line.startsWith("[")) {
+                inRendering = line.equalsIgnoreCase("[Rendering]");
+                continue;
+            }
+            if (!inRendering) continue;
+            String key = keyOf(line);
+            if (key.equals("internalresolutionmode") || key.equals("internalmode"))
+                mode = valueOf(line).toLowerCase(Locale.ROOT);
+            else if (key.equals("internalscale") || key.equals("scale")) {
+                try { scale = Integer.parseInt(valueOf(line)); } catch (NumberFormatException ignored) { }
+            }
+        }
+        for (int i = 0; i < choices.size(); ++i) {
+            ResolutionChoice c = choices.get(i);
+            if (c.mode.equalsIgnoreCase("Desktop") &&
+                (mode.equals("desktop") || mode.equals("native") || mode.equals("monitor"))) return i;
+            if (c.mode.equalsIgnoreCase("Scale") && mode.startsWith("scale") && c.scale == scale) return i;
+        }
+        return -1;
+    }
+
+    /** Rewrites only the resolution keys of [Rendering], keeping everything else in the file. */
+    private boolean writeResolution(ResolutionChoice choice) {
+        List<String> lines = readConfig();
+        List<String> out = new ArrayList<>();
+        boolean inRendering = false, sawRendering = false;
+        List<String> ours = new ArrayList<>();
+        ours.add("InternalResolutionMode=" + choice.mode);
+        if (choice.scale > 0) ours.add("InternalScale=" + choice.scale);
+        for (String raw : lines) {
+            String line = raw.trim();
+            if (line.startsWith("[")) {
+                inRendering = line.equalsIgnoreCase("[Rendering]");
+                out.add(raw);
+                if (inRendering) {
+                    sawRendering = true;
+                    out.addAll(ours);
+                }
+                continue;
+            }
+            if (inRendering) {
+                String key = keyOf(line);
+                if (key.equals("internalresolutionmode") || key.equals("internalmode") ||
+                    key.equals("internalscale") || key.equals("scale")) continue;
+            }
+            out.add(raw);
+        }
+        if (!sawRendering) {
+            out.add("[Rendering]");
+            out.add("Backend=Vulkan");
+            out.addAll(ours);
+        }
+        try {
+            Files.write(configFile().toPath(), out, StandardCharsets.UTF_8);
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    // --- Surface ---------------------------------------------------------------------------
+
     @Override public void surfaceCreated(SurfaceHolder holder) {
         nativeSetSurface(holder.getSurface());
         surfaceReady = true;
@@ -144,131 +368,12 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         super.onDestroy();
     }
 
-    private final class TouchOverlay extends View {
-        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Map<Integer, PointF> pointers = new HashMap<>();
-        private int joystickPointerId = -1;
-        private float analogX = 128, analogY = 128;
-        TouchOverlay() {
-            super(MainActivity.this);
-            setLayerType(View.LAYER_TYPE_SOFTWARE, null);
-            setOnTouchListener((view, event) -> handleTouch(event));
-        }
-
-        @Override protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-            int maxWidth = MeasureSpec.getSize(widthMeasureSpec);
-            int maxHeight = MeasureSpec.getSize(heightMeasureSpec);
-            int width = Math.min(maxWidth, maxHeight * 16 / 9);
-            int height = width * 9 / 16;
-            if (height > maxHeight) { height = maxHeight; width = height * 16 / 9; }
-            setMeasuredDimension(width, height);
-        }
-
-        private boolean handleTouch(MotionEvent event) {
-            int action = event.getActionMasked(), index = event.getActionIndex();
-            if ((action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) &&
-                joystickPointerId == -1 && event.getX(index) < getWidth() * .38f &&
-                event.getY(index) > getHeight() * .36f)
-                joystickPointerId = event.getPointerId(index);
-            if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN ||
-                action == MotionEvent.ACTION_MOVE) {
-                for (int i = 0; i < event.getPointerCount(); ++i)
-                    pointers.put(event.getPointerId(i), new PointF(event.getX(i), event.getY(i)));
-            } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP ||
-                       action == MotionEvent.ACTION_CANCEL) {
-                if (action == MotionEvent.ACTION_CANCEL) {
-                    pointers.clear();
-                    joystickPointerId = -1;
-                } else {
-                    int releasedId = event.getPointerId(index);
-                    pointers.remove(releasedId);
-                    if (joystickPointerId == releasedId) joystickPointerId = -1;
-                }
-            }
-
-            float w = Math.max(1, getWidth()), h = Math.max(1, getHeight());
-            int buttons = 0;
-            analogX = analogY = 128;
-            boolean accelerate = false, brake = false;
-            for (Map.Entry<Integer, PointF> entry : pointers.entrySet()) {
-                PointF point = entry.getValue();
-                float nx = point.x / w, ny = point.y / h;
-                if (entry.getKey() == joystickPointerId) {
-                    float dx = Math.max(-1, Math.min(1, (nx - .18f) / .20f));
-                    float dy = Math.max(-1, Math.min(1, (ny - .70f) / .26f));
-                    analogX = 128 + dx * 127;
-                    analogY = 128 + dy * 127;
-                } else if (nx >= .38f && nx <= .52f && ny >= .60f && ny <= .90f) {
-                    // The PSP D-pad has different actions from its analog stick:
-                    // D-pad right/left changes radio stations while driving.
-                    float dx = (nx - .45f) / .055f;
-                    float dy = (ny - .75f) / .10f;
-                    if (dx < -.45f) buttons |= PSP_LEFT;
-                    if (dx > .45f) buttons |= PSP_RIGHT;
-                    if (dy < -.45f) buttons |= PSP_UP;
-                    if (dy > .45f) buttons |= PSP_DOWN;
-                } else if (ny < .20f && nx < .22f) buttons |= PSP_L;
-                else if (ny < .20f && nx > .78f) buttons |= PSP_R;
-                else if (ny < .18f) buttons |= nx < .46f ? PSP_SELECT : PSP_START;
-                else if (nx > .60f && ny > .38f) {
-                    float dx = (nx - .82f) / .16f, dy = (ny - .70f) / .22f;
-                    if (Math.abs(dx) > Math.abs(dy)) buttons |= dx < 0 ? PSP_SQUARE : PSP_CIRCLE;
-                    else buttons |= dy < 0 ? PSP_TRIANGLE : PSP_CROSS;
-                    accelerate |= (buttons & PSP_CROSS) != 0;
-                    brake |= (buttons & PSP_SQUARE) != 0;
-                }
-            }
-            nativeSetInput(buttons, Math.round(analogX), Math.round(analogY), accelerate, brake);
-            invalidate();
-            return true;
-        }
-
-        @Override protected void onDraw(Canvas canvas) {
-            super.onDraw(canvas);
-            float w = getWidth(), h = getHeight(), r = Math.min(w, h) * .105f;
-            paint.setStyle(Paint.Style.FILL);
-            paint.setColor(0x55202020);
-            canvas.drawCircle(w * .18f, h * .70f, r * 1.8f, paint);
-            paint.setColor(0x8855CCFF);
-            canvas.drawCircle(w * (.18f + (analogX - 128) / 127f * .12f),
-                h * (.70f + (analogY - 128) / 127f * .12f), r * .72f, paint);
-            drawButton(canvas, w * .45f, h * .65f, r * .32f, "\u2191", 0x665588AA);
-            drawButton(canvas, w * .45f, h * .85f, r * .32f, "\u2193", 0x665588AA);
-            drawButton(canvas, w * .395f, h * .75f, r * .32f, "\u2190", 0x665588AA);
-            drawButton(canvas, w * .505f, h * .75f, r * .32f, "\u2192", 0x665588AA);
-            drawButton(canvas, w * .82f, h * .49f, r * .58f, "△", 0x8877DD88);
-            drawButton(canvas, w * .92f, h * .70f, r * .58f, "○", 0x88EE6677);
-            drawButton(canvas, w * .82f, h * .91f, r * .58f, "×", 0x8877AAFF);
-            drawButton(canvas, w * .72f, h * .70f, r * .58f, "□", 0x88DD77CC);
-            drawButton(canvas, w * .12f, h * .16f, r * .38f, "L", 0x66777777);
-            drawButton(canvas, w * .88f, h * .16f, r * .38f, "R", 0x66777777);
-            paint.setColor(0xAAFFFFFF);
-            paint.setTextSize(Math.max(14, r * .35f));
-            canvas.drawText("SELECT", w * .39f, h * .13f, paint);
-            canvas.drawText("START", w * .53f, h * .13f, paint);
-        }
-
-        private void drawButton(Canvas canvas, float x, float y, float radius,
-                                String label, int color) {
-            paint.setColor(color);
-            canvas.drawCircle(x, y, radius, paint);
-            paint.setColor(Color.WHITE);
-            paint.setTextAlign(Paint.Align.CENTER);
-            paint.setTextSize(radius * 1.15f);
-            canvas.drawText(label, x, y + radius * .38f, paint);
-            paint.setTextAlign(Paint.Align.LEFT);
-        }
-    }
-
+    /**
+     * The game picture, edge to edge. The game renders widescreen (Hor+) at the
+     * panel's own aspect - Widescreen is on by default on Android - so filling
+     * the screen shows more of the world rather than stretching it.
+     */
     private final class GameSurface extends SurfaceView {
         GameSurface() { super(MainActivity.this); }
-        @Override protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-            int maxWidth = MeasureSpec.getSize(widthMeasureSpec);
-            int maxHeight = MeasureSpec.getSize(heightMeasureSpec);
-            int width = Math.min(maxWidth, maxHeight * 16 / 9);
-            int height = width * 9 / 16;
-            if (height > maxHeight) { height = maxHeight; width = height * 16 / 9; }
-            setMeasuredDimension(width, height);
-        }
     }
 }

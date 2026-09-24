@@ -166,8 +166,20 @@ Java_com_psprecomp_vcs_MainActivity_nativeStatus(JNIEnv *env, jclass) {
 extern "C" JNIEXPORT void JNICALL
 Java_com_psprecomp_vcs_MainActivity_nativeSetSurface(JNIEnv *env, jclass, jobject surface) {
     ANativeWindow *window = surface != nullptr ? ANativeWindow_fromSurface(env, surface) : nullptr;
+    // Read before display_window_set_surface can set a buffer geometry on it:
+    // this is the panel size InternalResolutionMode=Desktop ("native") uses.
+    if (window != nullptr)
+        vcs::set_host_display_size(static_cast<std::uint32_t>(ANativeWindow_getWidth(window)),
+                                   static_cast<std::uint32_t>(ANativeWindow_getHeight(window)));
     vcs::display_window_set_surface(window);
     if (window != nullptr) ANativeWindow_release(window);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_psprecomp_vcs_MainActivity_nativeSetDisplaySize(JNIEnv *, jclass, jint width, jint height) {
+    if (width > 0 && height > 0)
+        vcs::set_host_display_size(static_cast<std::uint32_t>(width),
+                                   static_cast<std::uint32_t>(height));
 }
 
 extern "C" JNIEXPORT void JNICALL

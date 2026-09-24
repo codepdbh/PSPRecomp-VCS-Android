@@ -41,7 +41,12 @@ struct DisplayConfiguration {
     // The native PSP output remains the default so framebuffer hashes and
     // visual regressions are directly comparable with earlier stages.
     bool enabled{true};
+#if defined(__ANDROID__)
+    // The phone's own panel: what widescreen "auto" measures the aspect from.
+    DisplayResolutionMode resolution_mode{DisplayResolutionMode::Desktop};
+#else
     DisplayResolutionMode resolution_mode{DisplayResolutionMode::PspNative};
+#endif
     std::uint32_t custom_width{480u};
     std::uint32_t custom_height{272u};
     bool fullscreen{false};
@@ -83,8 +88,16 @@ struct RenderingConfiguration {
     // PSP-native remains authoritative by default. Higher modes allocate a
     // genuinely larger render target; they are not presentation upscalers.
     RenderingBackend backend{RenderingBackend::Software};
+#if defined(__ANDROID__)
+    // A phone panel is 1080p or more; 480x272 on it is a blur of big pixels.
+    // 3x (1440x816) is the minimum that reads as HD there, and the Vulkan
+    // renderer handles it at full speed on current hardware.
+    InternalResolutionMode internal_resolution_mode{InternalResolutionMode::Scale};
+    std::uint32_t internal_scale{3u};
+#else
     InternalResolutionMode internal_resolution_mode{InternalResolutionMode::PspNative};
     std::uint32_t internal_scale{2u};
+#endif
     std::uint32_t internal_width{960u};
     std::uint32_t internal_height{544u};
     // Anisotropic sampling of the game's own mip chain, 1 to 16. The PSP had
@@ -130,6 +143,11 @@ struct RenderingConfiguration {
     std::uint64_t dump_gpu_frame_vblank{0u};
 };
 
+// The host screen's size in pixels, for InternalResolutionMode=Desktop on
+// platforms where it cannot be queried from here (Android reports it from the
+// surface it is given). Zero until known.
+void set_host_display_size(std::uint32_t width, std::uint32_t height) noexcept;
+
 [[nodiscard]] InternalResolutionDimensions resolve_internal_resolution(
     const RenderingConfiguration &configuration) noexcept;
 
@@ -173,7 +191,14 @@ struct DiagnosticsConfiguration {
 //
 // Off by default: PSP parity stays the baseline for visual regressions.
 struct WidescreenConfiguration {
+#if defined(__ANDROID__)
+    // Phones are 19.5:9 or wider; the PSP's 16:9 picture left black bars at
+    // both sides. On by default so the game widens its own view (Hor+) to fill
+    // the panel instead of the picture being stretched.
+    bool enabled{true};
+#else
     bool enabled{false};
+#endif
     // 0/0 means "auto": derive the ratio from the presentation surface.
     std::uint32_t aspect_x{0u};
     std::uint32_t aspect_y{0u};

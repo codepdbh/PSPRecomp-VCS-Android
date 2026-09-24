@@ -6,6 +6,7 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +22,13 @@ namespace {
 
 constexpr std::uint32_t kWidth = 480u;
 constexpr std::uint32_t kHeight = 272u;
+// VCS renders the world (and the HUD over it) into a 512x320 surface at
+// 0x88000, then its 64 composition quads sample all of it back into the
+// 480x272 display. Measured on device: world scissor 512,320, composition UVs
+// up to 512,320. At 480x272 the world was cropped and the composition clamped
+// past the edge - the streaks down the bottom and right of the screen.
+constexpr std::uint32_t kWorldWidth = 512u;
+constexpr std::uint32_t kWorldHeight = 320u;
 constexpr VkDeviceSize kVertexCapacity = 32u * 1024u * 1024u;
 
 struct Buffer {
@@ -86,6 +94,20 @@ struct VulkanPreview {
     VkDescriptorSetLayout descriptor_layout{VK_NULL_HANDLE};
     VkDescriptorPool descriptor_pool{VK_NULL_HANDLE};
     VkSampler sampler{VK_NULL_HANDLE};
+    // Per-texture sampling state, indexed by texture_sampler_index(): the PSP
+    // chooses filtering and wrap/clamp per texture, and a single NEAREST+REPEAT
+    // sampler for everything is what made the ground render as hard blocks.
+    std::array<VkSampler, 16> texture_samplers{};
+    // Descriptor sets available for textures (the pool also holds the world
+    // target's), and so the hard ceiling on cached textures. See create_pipeline.
+    std::uint32_t texture_capacity{};
+    // Physical sizes of the two targets. Coordinates stay in PSP space (480x272
+    // display, 512x320 world) and are mapped onto these, so raising the internal
+    // resolution renders more pixels rather than stretching the PSP image.
+    std::uint32_t display_width{kWidth};
+    std::uint32_t display_height{kHeight};
+    std::uint32_t world_width{kWorldWidth};
+    std::uint32_t world_height{kWorldHeight};
     VkSampler world_sampler{VK_NULL_HANDLE};
     VkPipelineLayout pipeline_layout{VK_NULL_HANDLE};
     // Five PSP blend variants, each with 34 depth/texture combinations.
@@ -244,6 +266,8 @@ void destroy_backend(VulkanPreview &s) {
     if (s.world_sampler != VK_NULL_HANDLE)
         vkDestroySampler(s.device, s.world_sampler, nullptr);
     if (s.sampler != VK_NULL_HANDLE) vkDestroySampler(s.device, s.sampler, nullptr);
+    for (VkSampler sampler : s.texture_samplers)
+        if (sampler != VK_NULL_HANDLE) vkDestroySampler(s.device, sampler, nullptr);
         if (s.descriptor_pool != VK_NULL_HANDLE)
             vkDestroyDescriptorPool(s.device, s.descriptor_pool, nullptr);
         if (s.descriptor_layout != VK_NULL_HANDLE)
@@ -280,11 +304,12 @@ void destroy_backend(VulkanPreview &s) {
 
 bool create_color_image(VulkanPreview &s, VkImage &handle,
                         VkDeviceMemory &memory, VkImageView &image_view,
-                        VkImageUsageFlags extra_usage) {
+                        VkImageUsageFlags extra_usage,
+                        std::uint32_t width = kWidth, std::uint32_t height = kHeight) {
     VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     image.imageType = VK_IMAGE_TYPE_2D;
     image.format = VK_FORMAT_R8G8B8A8_UNORM;
-    image.extent = {kWidth, kHeight, 1u};
+    image.extent = {width, height, 1u};
     image.mipLevels = 1u;
     image.arrayLayers = 1u;
     image.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -323,7 +348,10 @@ bool create_depth_image(VulkanPreview &s) {
     VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     image.imageType = VK_IMAGE_TYPE_2D;
     image.format = VK_FORMAT_D16_UNORM;
-    image.extent = {kWidth, kHeight, 1u};
+    // Shared by both passes, so sized for the larger world one; an attachment
+    // may be bigger than the framebuffer that uses it.
+    image.extent = {std::max(s.world_width, s.display_width),
+                    std::max(s.world_height, s.display_height), 1u};
     image.mipLevels = 1u;
     image.arrayLayers = 1u;
     image.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -401,12 +429,14 @@ bool create_pipeline(VulkanPreview &s) {
     const std::array<VkImageView, 2> views{s.color_view, s.depth_view};
     framebuffer.attachmentCount = static_cast<std::uint32_t>(views.size());
     framebuffer.pAttachments = views.data();
-    framebuffer.width = kWidth;
-    framebuffer.height = kHeight;
+    framebuffer.width = s.display_width;
+    framebuffer.height = s.display_height;
     framebuffer.layers = 1u;
     if (vkCreateFramebuffer(s.device, &framebuffer, nullptr, &s.framebuffer) != VK_SUCCESS) return false;
     const std::array<VkImageView, 2> world_views{s.world_color_view, s.depth_view};
     framebuffer.pAttachments = world_views.data();
+    framebuffer.width = s.world_width;
+    framebuffer.height = s.world_height;
     if (vkCreateFramebuffer(s.device, &framebuffer, nullptr,
                             &s.world_framebuffer) != VK_SUCCESS) return false;
 
@@ -434,10 +464,24 @@ bool create_pipeline(VulkanPreview &s) {
     descriptor_layout.pBindings = &texture_binding;
     if (vkCreateDescriptorSetLayout(s.device, &descriptor_layout, nullptr,
                                     &s.descriptor_layout) != VK_SUCCESS) return false;
-    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024u};
+    // One descriptor set per cached texture. This was a fixed 1024, below the
+    // texture cache's own limit, so once a city scene held that many textures
+    // every new one failed to allocate its set and its draws - the HUD text
+    // among them - lost their texture. Sized from the cache limit now, which
+    // is itself capped by how many separate allocations the driver allows
+    // (each texture owns its image memory).
+    VkPhysicalDeviceProperties device_properties{};
+    vkGetPhysicalDeviceProperties(s.physical, &device_properties);
+    const std::uint32_t allocation_budget =
+        device_properties.limits.maxMemoryAllocationCount > 256u
+            ? device_properties.limits.maxMemoryAllocationCount - 256u : 256u;
+    s.texture_capacity = std::max<std::uint32_t>(256u, std::min<std::uint32_t>(
+        vcs_configuration().rendering.texture_cache_entries, std::min(allocation_budget, 8192u)));
+    const std::uint32_t pool_sets = s.texture_capacity + 16u;
+    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, pool_sets};
     VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pool.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    pool.maxSets = 1024u;
+    pool.maxSets = pool_sets;
     pool.poolSizeCount = 1u;
     pool.pPoolSizes = &pool_size;
     if (vkCreateDescriptorPool(s.device, &pool, nullptr, &s.descriptor_pool) != VK_SUCCESS)
@@ -548,8 +592,9 @@ bool create_pipeline(VulkanPreview &s) {
         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     blending.attachmentCount = 1u;
     blending.pAttachments = &blend_attachment;
-    const std::array<VkDynamicState, 2> dynamic_states{
-        VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+    const std::array<VkDynamicState, 3> dynamic_states{
+        VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+        VK_DYNAMIC_STATE_VIEWPORT};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
     dynamic.pDynamicStates = dynamic_states.data();
@@ -684,22 +729,53 @@ bool create_backend(VulkanPreview &s, std::string &error) {
     }
     VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (vkCreateFence(s.device, &fence, nullptr, &s.fence) != VK_SUCCESS ||
-        !create_color_image(s, s.color, s.color_memory, s.color_view, 0u) ||
+        !create_color_image(s, s.color, s.color_memory, s.color_view, 0u,
+                            s.display_width, s.display_height) ||
         !create_color_image(s, s.world_color, s.world_color_memory,
-                            s.world_color_view, VK_IMAGE_USAGE_SAMPLED_BIT) ||
+                            s.world_color_view, VK_IMAGE_USAGE_SAMPLED_BIT,
+                            s.world_width, s.world_height) ||
         !create_depth_image(s) || !create_pipeline(s) ||
         !create_buffer(s, kVertexCapacity, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, s.vertices_gpu) ||
-        !create_buffer(s, static_cast<VkDeviceSize>(kWidth) * kHeight * 4u,
+        !create_buffer(s, static_cast<VkDeviceSize>(s.display_width) * s.display_height * 4u,
                        VK_BUFFER_USAGE_TRANSFER_DST_BIT, s.readback)) {
         error = "Vulkan preview resource creation failed";
         return false;
     }
-    s.frame_rgba.resize(static_cast<std::size_t>(kWidth) * kHeight * 4u);
+    s.frame_rgba.resize(static_cast<std::size_t>(s.display_width) * s.display_height * 4u);
     return true;
 }
 
+std::uint32_t texture_sampler_index(const GeGpuDrawDescriptor &draw) noexcept {
+    return (draw.texture_min_linear ? 1u : 0u) | (draw.texture_mag_linear ? 2u : 0u) |
+           (draw.texture_clamp_u ? 4u : 0u) | (draw.texture_clamp_v ? 8u : 0u);
+}
+
+// The sampler for this draw's PSP filter/wrap state, created on first use.
+// Falls back to the shared nearest sampler if creation fails.
+VkSampler texture_sampler_for(VulkanPreview &s, const GeGpuDrawDescriptor &draw) {
+    const std::uint32_t index = texture_sampler_index(draw);
+    VkSampler &slot = s.texture_samplers[index];
+    if (slot != VK_NULL_HANDLE) return slot;
+    VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    info.minFilter = draw.texture_min_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    info.magFilter = draw.texture_mag_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    info.addressModeU = draw.texture_clamp_u ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+                                             : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    info.addressModeV = draw.texture_clamp_v ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+                                             : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    info.maxLod = 0.0f;  // only the base level is uploaded
+    if (vkCreateSampler(s.device, &info, nullptr, &slot) != VK_SUCCESS) {
+        slot = VK_NULL_HANDLE;
+        return s.sampler;
+    }
+    return slot;
+}
+
 bool create_texture(VulkanPreview &s, std::uint32_t width, std::uint32_t height,
-                    std::span<const std::byte> rgba, Texture &texture) {
+                    std::span<const std::byte> rgba, Texture &texture,
+                    VkSampler sampler = VK_NULL_HANDLE) {
     if (width == 0u || height == 0u || width > 2048u || height > 2048u) return false;
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * 4u;
     if (rgba.size() < bytes) return false;
@@ -746,7 +822,7 @@ bool create_texture(VulkanPreview &s, std::uint32_t width, std::uint32_t height,
     descriptor.pSetLayouts = &s.descriptor_layout;
     if (vkAllocateDescriptorSets(s.device, &descriptor, &texture.descriptor) != VK_SUCCESS)
         return false;
-    VkDescriptorImageInfo image_info{s.sampler, texture.view,
+    VkDescriptorImageInfo image_info{sampler != VK_NULL_HANDLE ? sampler : s.sampler, texture.view,
                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     write.dstSet = texture.descriptor;
@@ -811,6 +887,29 @@ bool initialize_ge_gpu_backend(std::string &error) {
         return true;
     }
     s.report.requested = GeGpuBackendKind::Vulkan;
+    {
+        // The configured internal resolution is the display target; the world
+        // surface gets the same scale factor over its own 512x320.
+        const InternalResolutionDimensions dims =
+            resolve_internal_resolution(vcs_configuration().rendering);
+        s.display_height = std::clamp<std::uint32_t>(dims.height, kHeight, 4096u);
+        s.display_width = std::clamp<std::uint32_t>(dims.width, kWidth, 4096u);
+        // Widescreen: the game widens its own frustum to the panel's aspect
+        // and the picture is shown full-screen, so the target takes the
+        // panel's shape too - otherwise its pixels are stretched sideways.
+        const VcsConfiguration &config = vcs_configuration();
+        const DisplaySurfaceDimensions panel = resolve_display_surface_dimensions(config.display);
+        if (widescreen_stretch_factor(config, panel.width, panel.height) > 1.0001f &&
+            panel.width != 0u && panel.height != 0u) {
+            s.display_width = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(s.display_height) * panel.width + panel.height / 2u) /
+                panel.height), kWidth, 4096u);
+        }
+        s.world_width = static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(kWorldWidth) * s.display_width + kWidth / 2u) / kWidth);
+        s.world_height = static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(kWorldHeight) * s.display_height + kHeight / 2u) / kHeight);
+    }
     if (!create_backend(s, error)) {
         __android_log_print(ANDROID_LOG_WARN, "VCSVulkan", "Falling back to software: %s",
                             error.c_str());
@@ -849,17 +948,17 @@ bool initialize_ge_gpu_backend(std::string &error) {
     s.report.textured_pipeline_created = true;
     s.report.alpha_test_shader_active = true;
     s.report.observed_texture_function_shader_active = true;
-    s.report.offscreen_width = kWidth;
-    s.report.offscreen_height = kHeight;
+    s.report.offscreen_width = s.display_width;
+    s.report.offscreen_height = s.display_height;
     s.report.message = s.authoritative
         ? "Vulkan GE active: displayed framebuffer is rasterized on GPU"
         : "Vulkan GE preview: color, RGBA textures, alpha and D16 depth";
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(s.physical, &properties);
     __android_log_print(ANDROID_LOG_INFO, "VCSVulkan",
-        "%s initialized on %s: %zu pipelines, %ux%u offscreen",
+        "%s initialized on %s: %zu pipelines, display %ux%u, world %ux%u",
         s.authoritative ? "Renderer" : "Preview", properties.deviceName,
-        s.pipelines.size(), kWidth, kHeight);
+        s.pipelines.size(), s.display_width, s.display_height, s.world_width, s.world_height);
     error.clear();
     return true;
 }
@@ -925,7 +1024,29 @@ bool ge_gpu_backend_is_framebuffer_feedback_texture(const GeGpuDrawDescriptor &d
         (draw.texture_address & 0x001FFFF0u) == s.world_framebuffer_address &&
         (draw.framebuffer_address & 0x001FFFF0u) == s.display_framebuffer;
 }
-GeGpuWidescreenHud ge_gpu_backend_widescreen_hud(const GeGpuDrawDescriptor &) noexcept { return {}; }
+GeGpuWidescreenHud ge_gpu_backend_widescreen_hud(const GeGpuDrawDescriptor &draw) noexcept {
+    // The widened frustum fixes the 3D view; the 2D interface has no
+    // projection, so without this it is stretched across the wider screen
+    // along with everything else. Same correction as the DX12 backend: pull
+    // through-mode draws back toward the centre of their own target.
+    GeGpuWidescreenHud hud{};
+    const auto &s = state();
+    if (!s.enabled || !s.authoritative) return hud;
+    const VcsConfiguration &config = vcs_configuration();
+    if (!config.initialized || !config.widescreen.enabled) return hud;
+    const DisplaySurfaceDimensions panel = resolve_display_surface_dimensions(config.display);
+    const float shrink = widescreen_stretch_factor(config, panel.width, panel.height);
+    if (!std::isfinite(shrink) || shrink <= 0.0f || std::abs(shrink - 1.0f) < 1.0e-5f) return hud;
+    // The HUD is drawn into the 512-wide world surface, which the composition
+    // maps onto the 480-wide display.
+    const bool world = s.world_framebuffer_address != 0u &&
+        (draw.framebuffer_address & 0x001FFFF0u) == s.world_framebuffer_address;
+    const std::uint32_t logical_width = world ? kWorldWidth : kWidth;
+    hud.shrink = shrink;
+    hud.display_scale_x = static_cast<float>(kWidth) / static_cast<float>(logical_width);
+    hud.source_center = static_cast<float>(logical_width) * 0.5f;
+    return hud;
+}
 void ge_gpu_backend_note_through_extent(const GeGpuDrawDescriptor &, float, float) noexcept {}
 bool ge_gpu_backend_adopt_shared_texture(const GeGpuDrawDescriptor &) noexcept { return false; }
 bool ge_gpu_backend_texture_available(const GeGpuDrawDescriptor &draw) noexcept {
@@ -956,11 +1077,19 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(const GeGpuDrawDescripto
     if (!s.enabled || !draw.texture_enabled || width == 0u || height == 0u) return false;
     const std::uint64_t key = texture_key(draw);
     auto found = s.textures.find(key);
-    constexpr std::uint64_t kTextureBudget = 128ull * 1024ull * 1024ull;
+    // Same limits the DX12 backend reads (Rendering.TextureCacheEntries/MB).
+    // A fixed 512 entries was fine for a quiet street, but a drive through
+    // the city draws more distinct textures than that in ONE frame: nothing
+    // could be evicted, uploads were refused, and those draws fell back to
+    // flat colour - the radar and HUD blinking in as solid blocks.
+    const std::uint64_t kTextureBudget = static_cast<std::uint64_t>(
+        vcs_configuration().rendering.texture_cache_mb) * 1024ull * 1024ull;
+    const std::size_t kTextureEntries = std::min<std::size_t>(
+        vcs_configuration().rendering.texture_cache_entries, s.texture_capacity);
     const std::uint64_t base_bytes = static_cast<std::uint64_t>(width) * height * 4u;
     if (base_bytes > kTextureBudget) return false;
     const std::uint64_t replaced_bytes = found == s.textures.end() ? 0u : found->second.bytes;
-    while ((found == s.textures.end() && s.textures.size() >= 512u) ||
+    while ((found == s.textures.end() && s.textures.size() >= kTextureEntries) ||
            s.texture_bytes - replaced_bytes + base_bytes > kTextureBudget) {
         auto victim = s.textures.end();
         for (auto it = s.textures.begin(); it != s.textures.end(); ++it) {
@@ -969,7 +1098,16 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(const GeGpuDrawDescripto
             if (victim == s.textures.end() ||
                 it->second.checked_frame < victim->second.checked_frame) victim = it;
         }
-        if (victim == s.textures.end()) return false;
+        if (victim == s.textures.end()) {
+            static unsigned logged_refusals = 0u;
+            if (logged_refusals < 20u) {
+                ++logged_refusals;
+                __android_log_print(ANDROID_LOG_WARN, "VCSVulkan",
+                    "texture upload refused: cache full of this frame's textures (%zu entries, %llu bytes)",
+                    s.textures.size(), static_cast<unsigned long long>(s.texture_bytes));
+            }
+            return false;
+        }
         s.texture_bytes -= victim->second.bytes;
         destroy_texture(s, victim->second);
         s.textures.erase(victim);
@@ -977,7 +1115,15 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(const GeGpuDrawDescripto
     }
     Texture texture{};
     try {
-        if (!create_texture(s, width, height, rgba, texture)) {
+        if (!create_texture(s, width, height, rgba, texture, texture_sampler_for(s, draw))) {
+            static unsigned logged_failures = 0u;
+            if (logged_failures < 20u) {
+                ++logged_failures;
+                __android_log_print(ANDROID_LOG_WARN, "VCSVulkan",
+                    "texture create failed %ux%u fmt=%u cached=%zu/%u bytes=%llu",
+                    width, height, draw.texture_format, s.textures.size(), s.texture_capacity,
+                    static_cast<unsigned long long>(s.texture_bytes));
+            }
             destroy_texture(s, texture);
             return false;
         }
@@ -1014,10 +1160,46 @@ bool ge_gpu_backend_copy_last_texture_rgba(std::span<std::byte> destination) noe
     return true;
 }
 
+// Measured extents of the world surface and of the composition that samples it,
+// reset every time they are logged. The world target is still a fixed 480x272,
+// and these numbers decide what size it has to be instead.
+struct ExtentDiagnostics {
+    float world_max_x{}, world_max_y{};
+    std::int32_t world_scissor_x1{}, world_scissor_y1{};
+    std::uint32_t world_stride{};
+    std::uint32_t feedback_texture_width{}, feedback_texture_height{};
+    float feedback_max_u{}, feedback_max_v{};
+    float feedback_max_x{}, feedback_max_y{};
+};
+ExtentDiagnostics g_extent_diag;
+
 void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &draw,
                                                 std::span<const GeGpuVertex> triangles) noexcept {
     VulkanPreview &s = state();
     if (!s.enabled || triangles.empty()) return;
+    {
+        ExtentDiagnostics &d = g_extent_diag;
+        const std::uint32_t target = draw.framebuffer_address & 0x001FFFF0u;
+        if (target == s.world_framebuffer_address && !draw.through && !draw.clear_mode) {
+            for (const GeGpuVertex &v : triangles) {
+                d.world_max_x = std::max(d.world_max_x, v.x);
+                d.world_max_y = std::max(d.world_max_y, v.y);
+            }
+            d.world_scissor_x1 = std::max(d.world_scissor_x1, draw.scissor_x1);
+            d.world_scissor_y1 = std::max(d.world_scissor_y1, draw.scissor_y1);
+            d.world_stride = std::max(d.world_stride, draw.framebuffer_stride);
+        }
+        if (draw.texture_enabled && ge_gpu_backend_is_framebuffer_feedback_texture(draw)) {
+            d.feedback_texture_width = std::max(d.feedback_texture_width, draw.texture_width);
+            d.feedback_texture_height = std::max(d.feedback_texture_height, draw.texture_height);
+            for (const GeGpuVertex &v : triangles) {
+                d.feedback_max_u = std::max(d.feedback_max_u, v.u);
+                d.feedback_max_v = std::max(d.feedback_max_v, v.v);
+                d.feedback_max_x = std::max(d.feedback_max_x, v.x);
+                d.feedback_max_y = std::max(d.feedback_max_y, v.y);
+            }
+        }
+    }
     const std::size_t max_vertices = static_cast<std::size_t>(kVertexCapacity / sizeof(GeGpuVertex));
     if (triangles.size() > max_vertices ||
         s.vertices.size() > max_vertices - triangles.size()) return;
@@ -1029,8 +1211,8 @@ void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &draw,
         s.vertices.insert(s.vertices.end(), triangles.begin(), triangles.end());
         if (textured && draw.texture_width != 0u && draw.texture_height != 0u) {
             for (std::size_t index = first; index < s.vertices.size(); ++index) {
-                s.vertices[index].u /= static_cast<float>(feedback ? kWidth : draw.texture_width);
-                s.vertices[index].v /= static_cast<float>(feedback ? kHeight : draw.texture_height);
+                s.vertices[index].u /= static_cast<float>(feedback ? kWorldWidth : draw.texture_width);
+                s.vertices[index].v /= static_cast<float>(feedback ? kWorldHeight : draw.texture_height);
             }
         }
         s.batches.push_back({draw, first, static_cast<std::uint32_t>(triangles.size()),
@@ -1111,6 +1293,14 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             static_cast<unsigned long long>(s.report.decoded_texture_uploads),
             static_cast<unsigned long long>(s.report.texture_cache_hits),
             s.software_menu_active ? 1 : 0);
+        const ExtentDiagnostics &d = g_extent_diag;
+        __android_log_print(ANDROID_LOG_INFO, "VCSVulkan",
+            "extent world=%05x max_xy=%.1f,%.1f scissor=%d,%d stride=%u | feedback tex=%ux%u max_uv=%.1f,%.1f max_xy=%.1f,%.1f",
+            s.world_framebuffer_address, d.world_max_x, d.world_max_y,
+            d.world_scissor_x1, d.world_scissor_y1, d.world_stride,
+            d.feedback_texture_width, d.feedback_texture_height,
+            d.feedback_max_u, d.feedback_max_v, d.feedback_max_x, d.feedback_max_y);
+        g_extent_diag = {};
     }
     std::vector<GeGpuVertex> selected;
     std::vector<DrawBatch> world_batches;
@@ -1170,17 +1360,26 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     pass.renderPass = s.render_pass;
     pass.framebuffer = s.framebuffer;
-    pass.renderArea = {{0, 0}, {kWidth, kHeight}};
+    pass.renderArea = {{0, 0}, {s.display_width, s.display_height}};
     pass.clearValueCount = static_cast<std::uint32_t>(clear.size());
     pass.pClearValues = clear.data();
     const VkBuffer vertex_buffer = s.vertices_gpu.handle;
     const VkDeviceSize offset = 0u;
     vkCmdBindVertexBuffers(s.command, 0u, 1u, &vertex_buffer, &offset);
+    // Each pass maps PSP screen coordinates onto its own surface: the world at
+    // 512x320, the display at 480x272. Viewport, vertex scale and scissor limits
+    // all follow the pass.
+    const auto record_batches = [&](const std::vector<DrawBatch> &batches,
+                                    std::uint32_t width, std::uint32_t height,
+                                    std::uint32_t physical_width,
+                                    std::uint32_t physical_height) {
+    const VkViewport viewport{0.0f, 0.0f, static_cast<float>(physical_width),
+                              static_cast<float>(physical_height), 0.0f, 1.0f};
+    vkCmdSetViewport(s.command, 0u, 1u, &viewport);
     const std::array<float, 4> scale{
-        2.0f / static_cast<float>(kWidth), 2.0f / static_cast<float>(kHeight), -1.0f, -1.0f};
+        2.0f / static_cast<float>(width), 2.0f / static_cast<float>(height), -1.0f, -1.0f};
     vkCmdPushConstants(s.command, s.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
                        0u, sizeof(scale), scale.data());
-    const auto record_batches = [&](const std::vector<DrawBatch> &batches) {
     for (const DrawBatch &batch : batches) {
         const std::array<std::uint32_t, 4> alpha{
             batch.draw.alpha_test_enabled ? 1u : 0u,
@@ -1201,6 +1400,24 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         const bool textured = batch.framebuffer_feedback ||
             (batch.textured && texture != s.textures.end() &&
              texture->second.descriptor != VK_NULL_HANDLE);
+        // A textured draw whose image is not resident (refused or evicted since
+        // it was queued) is skipped rather than drawn untextured: missing for a
+        // frame is far less visible than a block of its flat vertex colour.
+        if (batch.draw.texture_enabled && !textured) {
+            ++s.report.missing_texture_draw_calls;
+            static unsigned logged_missing = 0u;
+            if (logged_missing < 40u) {
+                ++logged_missing;
+                __android_log_print(ANDROID_LOG_INFO, "VCSVulkan",
+                    "skip untextured target=%05x tex=%08x fmt=%u %ux%u bw=%u clut=%08x through=%d queued_textured=%d cached=%d",
+                    batch.draw.framebuffer_address & 0x001FFFF0u, batch.draw.texture_address,
+                    batch.draw.texture_format, batch.draw.texture_width, batch.draw.texture_height,
+                    batch.draw.texture_buffer_width, batch.draw.clut_address,
+                    batch.draw.through ? 1 : 0, batch.textured ? 1 : 0,
+                    texture != s.textures.end() ? 1 : 0);
+            }
+            continue;
+        }
         const std::uint32_t pipeline_index = batch.draw.depth_test_enabled
             ? 2u + (batch.draw.depth_function & 7u) * 4u +
                 (batch.draw.depth_write_enabled ? 2u : 0u) + (textured ? 1u : 0u)
@@ -1236,10 +1453,19 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             vkCmdPushConstants(s.command, s.pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                                32u, sizeof(environment), environment.data());
         }
-        const std::int32_t x0 = std::clamp(batch.draw.scissor_x0, 0, static_cast<int>(kWidth));
-        const std::int32_t y0 = std::clamp(batch.draw.scissor_y0, 0, static_cast<int>(kHeight));
-        const std::int32_t x1 = std::clamp(batch.draw.scissor_x1 + 1, 0, static_cast<int>(kWidth));
-        const std::int32_t y1 = std::clamp(batch.draw.scissor_y1 + 1, 0, static_cast<int>(kHeight));
+        // Scissor arrives in PSP pixels; scale it onto the physical target.
+        const auto sx = [&](std::int32_t value) {
+            return static_cast<std::int32_t>(std::clamp<std::int64_t>(
+                static_cast<std::int64_t>(value) * physical_width / width, 0, physical_width));
+        };
+        const auto sy = [&](std::int32_t value) {
+            return static_cast<std::int32_t>(std::clamp<std::int64_t>(
+                static_cast<std::int64_t>(value) * physical_height / height, 0, physical_height));
+        };
+        const std::int32_t x0 = sx(batch.draw.scissor_x0);
+        const std::int32_t y0 = sy(batch.draw.scissor_y0);
+        const std::int32_t x1 = sx(batch.draw.scissor_x1 + 1);
+        const std::int32_t y1 = sy(batch.draw.scissor_y1 + 1);
         if (x1 <= x0 || y1 <= y0) continue;
         VkRect2D scissor{{x0, y0},
                          {static_cast<std::uint32_t>(x1 - x0),
@@ -1250,8 +1476,9 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     };
     if (!world_batches.empty()) {
         pass.framebuffer = s.world_framebuffer;
+        pass.renderArea = {{0, 0}, {s.world_width, s.world_height}};
         vkCmdBeginRenderPass(s.command, &pass, VK_SUBPASS_CONTENTS_INLINE);
-        record_batches(world_batches);
+        record_batches(world_batches, kWorldWidth, kWorldHeight, s.world_width, s.world_height);
         vkCmdEndRenderPass(s.command);
         VkImageMemoryBarrier world_barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         world_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -1269,8 +1496,9 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             1u, &world_barrier);
     }
     pass.framebuffer = s.framebuffer;
+    pass.renderArea = {{0, 0}, {s.display_width, s.display_height}};
     vkCmdBeginRenderPass(s.command, &pass, VK_SUBPASS_CONTENTS_INLINE);
-    record_batches(display_batches);
+    record_batches(display_batches, kWidth, kHeight, s.display_width, s.display_height);
     vkCmdEndRenderPass(s.command);
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -1288,7 +1516,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     VkBufferImageCopy copy{};
     copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copy.imageSubresource.layerCount = 1u;
-    copy.imageExtent = {kWidth, kHeight, 1u};
+    copy.imageExtent = {s.display_width, s.display_height, 1u};
     vkCmdCopyImageToBuffer(s.command, s.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            s.readback.handle, 1u, &copy);
     result = vkEndCommandBuffer(s.command);
