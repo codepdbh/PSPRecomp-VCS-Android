@@ -11,6 +11,8 @@ set(PSPRECOMP_HOST_AVX OFF CACHE BOOL "" FORCE)
 add_subdirectory("${PSPRECOMP_REPO_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/psprecomp")
 
 add_library(vcs_android SHARED
-    app/src/main/cpp/android_jni.cpp)
-target_include_directories(vcs_android PRIVATE "${PSPRECOMP_REPO_DIR}/include")
-target_link_libraries(vcs_android PRIVATE vcs_guest_core psprecomp_core log)
+    app/src/main/cpp/android_game_runtime.cpp)
+target_include_directories(vcs_android PRIVATE
+    "${PSPRECOMP_REPO_DIR}/include"
+    "${PSPRECOMP_REPO_DIR}/profiles/vcs/host")
+target_link_libraries(vcs_android PRIVATE vcs_guest_core psprecomp_core android log)

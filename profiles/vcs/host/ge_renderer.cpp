@@ -436,6 +436,14 @@ private:
             }
         }
         if (!explicitly_configured) {
+#if defined(__ANDROID__)
+            // Mobile cores share a small power/thermal budget. A device trace
+            // showed seven workers spending roughly a third of all sampled
+            // CPU cycles polling for the next tiny raster job. Four total
+            // participants retain scanline parallelism without waking every
+            // core for each triangle.
+            requested = std::min(requested, 4u);
+#else
             // The guest Allegrex stream is intentionally serial, but host-side
             // decode/raster work is not.  Stage 39 capped this pool at eight
             // participants, leaving a large part of 12/16/20/24-thread desktop CPUs
@@ -443,6 +451,7 @@ private:
             // CPU up to the pool's conservative hard limit; the caller is one of
             // the participants, so this creates at most kMaxThreads-1 workers.
             requested = std::min(requested, kMaxThreads);
+#endif
         }
         worker_count_ = std::max(1u, std::min(requested, kMaxThreads));
         if (worker_count_ <= 1u) return;
@@ -510,7 +519,11 @@ private:
     static constexpr unsigned kChunksPerParticipant = 4u;
     // Roughly one to a few milliseconds on modern x86. This keeps workers hot
     // across adjacent draw calls, then parks them during real frame idle time.
+#if defined(__ANDROID__)
+    static constexpr unsigned kWorkerSpins = 8192u;
+#else
     static constexpr unsigned kWorkerSpins = 262144u;
+#endif
 
     std::vector<std::thread> workers_;
     void *body_context_{};
@@ -1915,6 +1928,8 @@ bool software_raster_skipped(const std::array<std::uint32_t, 256> &commands) noe
     if (skip_owned) {
         const std::uint32_t owned = ge_gpu_backend_owned_framebuffer();
         if (owned != 0u && target == owned) return true;
+        if (owned != 0u && vcs_configuration().rendering.backend == RenderingBackend::Vulkan &&
+            target == ge_gpu_backend_display_framebuffer()) return true;
     }
     if (skip_displayed && ge_gpu_backend_presents_directly()) {
         const std::uint32_t displayed = ge_gpu_backend_display_framebuffer();
@@ -2678,16 +2693,17 @@ FragmentSetup make_fragment_setup_cached(const std::array<std::uint32_t, 256> &c
     // Only registers consumed by make_fragment_setup participate. Most city
     // draws repeat this state for long runs, so avoid decoding it again until a
     // relevant register actually changes.
-    constexpr std::array<std::uint8_t, 23> regs{{
+    constexpr std::size_t register_count = 23u;
+    constexpr std::array<std::uint8_t, register_count> regs{{
         0x9D,0xD2,0x9C,0xD4,0xD5,0xD3,0x1E,0xE8,0xE9,0x9F,0x9E,0x23,
         0xDE,0xE7,0xDF,0x21,0xE0,0xE1,0xDB,0x22,0xC9,0xCA,0x00}};
     struct Cache {
-        std::array<std::uint32_t, regs.size()> values{};
+        std::array<std::uint32_t, register_count> values{};
         FragmentSetup setup{};
         bool valid{};
     };
     static thread_local Cache cache;
-    std::array<std::uint32_t, regs.size()> values{};
+    std::array<std::uint32_t, register_count> values{};
     for (std::size_t i = 0; i + 1 < regs.size(); ++i) values[i] = commands[regs[i]];
     // Framebuffer/depth base helpers also consume the high-address words.
     values.back() = commands[0x9C] ^ (commands[0x9E] * 0x9E3779B9u);

@@ -24,7 +24,7 @@ using RuntimePostImportHook = void (*)(Runtime &, AllegrexContext &);
 RuntimePostImportHook g_post_import_hook = nullptr;
 std::int32_t g_runtime_thread_uid = -1;
 std::array<char, 64> g_runtime_thread_name{};
-std::uint32_t g_runtime_dispatch_pc = 0u;
+std::atomic_uint32_t g_runtime_dispatch_pc{0u};
 RuntimeHeartbeatHook g_heartbeat_hook = nullptr;
 std::uint64_t g_heartbeat_interval = 0u;
 RuntimeStarvationHook g_starvation_hook = nullptr;
@@ -119,7 +119,9 @@ void set_runtime_thread_identity(std::int32_t uid, const std::string &name) noex
 }
 std::int32_t runtime_thread_uid() noexcept { return g_runtime_thread_uid; }
 const char *runtime_thread_name() noexcept { return g_runtime_thread_name.data(); }
-std::uint32_t runtime_dispatch_pc() noexcept { return g_runtime_dispatch_pc; }
+std::uint32_t runtime_dispatch_pc() noexcept {
+    return g_runtime_dispatch_pc.load(std::memory_order_relaxed);
+}
 RuntimeExecutionContextToken capture_runtime_execution_context() noexcept {
     return RuntimeExecutionContextToken{g_runtime_thread_uid, g_runtime_thread_switch_generation_fast};
 }

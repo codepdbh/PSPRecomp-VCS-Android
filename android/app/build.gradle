@@ -8,7 +8,7 @@ android {
 
     defaultConfig {
         applicationId "com.psprecomp.vcs"
-        minSdk 24
+        minSdk 26  // AAudio (audio_output_android.cpp) is API 26+
         targetSdk 35
         versionCode 1
         versionName "0.1.0-dev"
@@ -19,7 +19,9 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments "-DANDROID_STL=c++_static"
+                // Release native code even in the debug APK: the ~180k AOT
+                // functions at the Debug variant's -O0 run the game at ~10% speed.
+                arguments "-DANDROID_STL=c++_static", "-DCMAKE_BUILD_TYPE=Release"
                 cppFlags "-std=c++20"
             }
         }

@@ -12,6 +12,7 @@ namespace vcs {
 enum class GeGpuBackendKind : std::uint8_t {
     Software,
     DirectX12,
+    Vulkan,
 };
 
 struct GeGpuDrawDescriptor {
@@ -384,6 +385,7 @@ struct GeGpuBackendReport {
     // therefore handed back to the software path instead of being presented.
     std::uint64_t frames_without_displayed_target{};
     bool gpu_frame_presented_to_window{};
+    bool software_fallback_frame{};
     bool release_candidate_ready{};
     std::uint64_t texture_samplers_created{};
     std::uint64_t texture_descriptor_sets_allocated{};

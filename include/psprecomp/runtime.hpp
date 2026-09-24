@@ -5,6 +5,7 @@
 #include "psprecomp/nid_registry.hpp"
 
 #include <cstdint>
+#include <atomic>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -91,6 +92,10 @@ public:
 
     void run(std::uint32_t entry, std::uint64_t max_dispatches = 10'000'000u);
     void stop(std::string reason);
+    // Thread-safe stop request for native host lifecycle events. The guest loop
+    // observes this at its next dispatch boundary; stop_reason() stays reserved
+    // for diagnostics produced by the emulation thread itself.
+    void request_stop() noexcept { stopped_.store(true, std::memory_order_relaxed); }
     [[nodiscard]] bool stopped() const noexcept;
     [[nodiscard]] const std::string &stop_reason() const noexcept;
 
@@ -322,7 +327,7 @@ private:
     std::unordered_map<std::uint32_t, NativeFastPath> native_fast_paths_;
     std::vector<const HleFunction *> import_bindings_;
     std::filesystem::path game_root_;
-    bool stopped_{};
+    std::atomic_bool stopped_{};
     std::string stop_reason_;
     bool hle_histogram_enabled_{};
     // keep high-frequency dispatch counters completely cold unless

@@ -297,12 +297,23 @@ void apply_rendering_key(VcsConfiguration &config, const std::string &key,
             config.rendering.backend = RenderingBackend::Software;
         else if (backend == "directx12" || backend == "dx12" || backend == "d3d12" || backend == "gpu")
             config.rendering.backend = RenderingBackend::DirectX12;
+        else if (backend == "vulkanpreview") {
+#if defined(__ANDROID__)
+            config.rendering.backend = RenderingBackend::VulkanPreview;
+#else
+            warning(config, line, "Rendering.Backend=VulkanPreview requires Android");
+#endif
+        }
         else if (backend == "vulkan") {
+#if defined(__ANDROID__)
+            config.rendering.backend = RenderingBackend::Vulkan;
+#else
             // Stage 44 removes Vulkan from the Windows runtime. Keep the old
             // spelling as a migration alias so an existing INI does not silently
             // fall back to the CPU renderer.
             config.rendering.backend = RenderingBackend::DirectX12;
             warning(config, line, "Rendering.Backend=Vulkan is deprecated; using DirectX12");
+#endif
         } else
             warning(config, line, "Rendering.Backend expects Software or DirectX12");
         return;
@@ -841,6 +852,8 @@ const char *rendering_backend_name(RenderingBackend backend) noexcept {
     switch (backend) {
     case RenderingBackend::Software: return "Software";
     case RenderingBackend::DirectX12: return "DirectX 12";
+    case RenderingBackend::VulkanPreview: return "Vulkan preview";
+    case RenderingBackend::Vulkan: return "Vulkan";
     }
     return "Unknown";
 }

@@ -93,6 +93,15 @@ if(PSPRECOMP_PROFILE_GUIDED_AOT)
     endif()
 endif()
 
+# One VCS AOT unit overwhelms NDK Clang's optimizer at -O2 on the Windows
+# cross-build host. Keep the rest of the Android corpus at -O2 and use -O1 for
+# this single large unit so a first device build remains practical.
+if(ANDROID)
+    set_source_files_properties(
+        "${VCS_PROFILE_DIR}/generated/generated_unit_0102.cpp"
+        PROPERTIES COMPILE_OPTIONS "-O1;-g0")
+endif()
+
 if(MSVC AND PSPRECOMP_NATIVE_AVX2)
     # MSVC 19.44's AVX2 optimizer crashes (C1001/c2.dll) on this translation
     # unit, while the identical /Ox /Ob0 compile completes in ~3 s with AVX.
@@ -148,6 +157,22 @@ if(ANDROID)
     add_library(vcs_guest_core STATIC
         host/vcs_profile.cpp
         host/vcs_native_fast_paths.cpp
+        host/framebuffer_capture.cpp
+        host/vcs_config.cpp
+        host/vcs_bootstrap_paths.cpp
+        host/vcs_camera_input.cpp
+        host/vcs_vehicle_input.cpp
+        host/vcs_fps_overlay.cpp
+        host/vcs_project2dfx.cpp
+        host/vcs_project2dfx_lights.cpp
+        host/vcs_draw_distance_patch.cpp
+        host/vcs_runtime_log.cpp
+        host/vcs_hdr_post_dx12_stub.cpp
+        host/ge_renderer.cpp
+        host/ge_gpu_backend_vulkan.cpp
+        host/display_window_android.cpp
+        host/audio_output_android.cpp
+        host/vcs_media_decoder_android.cpp
         ${VCS_GENERATED}
     )
     target_include_directories(vcs_guest_core PRIVATE
@@ -155,7 +180,7 @@ if(ANDROID)
         "${VCS_PROFILE_DIR}/generated"
         "${VCS_PROFILE_DIR}/third_party/ffmpeg/include"
     )
-    target_link_libraries(vcs_guest_core PRIVATE psprecomp_core ${CMAKE_DL_LIBS})
+    target_link_libraries(vcs_guest_core PRIVATE psprecomp_core ${CMAKE_DL_LIBS} android log aaudio vulkan)
     set_target_properties(vcs_guest_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
     return()
 endif()

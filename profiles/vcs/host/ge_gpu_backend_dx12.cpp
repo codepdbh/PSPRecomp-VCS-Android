@@ -4258,6 +4258,7 @@ const char *ge_gpu_backend_name(GeGpuBackendKind kind) noexcept {
     switch (kind) {
     case GeGpuBackendKind::Software: return "software";
     case GeGpuBackendKind::DirectX12: return "directx12";
+    case GeGpuBackendKind::Vulkan: return "vulkan";
     }
     return "unknown";
 }

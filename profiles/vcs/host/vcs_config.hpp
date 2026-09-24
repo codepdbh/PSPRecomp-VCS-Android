@@ -33,6 +33,8 @@ enum class InternalResolutionMode : std::uint8_t {
 enum class RenderingBackend : std::uint8_t {
     Software,
     DirectX12,
+    VulkanPreview,
+    Vulkan,
 };
 
 struct DisplayConfiguration {
@@ -146,7 +148,11 @@ struct TimingConfiguration {
     // Native VCS renders every other 59.94 Hz vblank (30 FPS). 60 removes that
     // skip; 120/240 also raise the virtual display cadence so they are real
     // game-frame targets rather than duplicated presentation frames.
+#if defined(__ANDROID__)
+    std::uint32_t frame_rate{60u};
+#else
     std::uint32_t frame_rate{240u};
+#endif
     bool realtime_speed_diagnostics{false};
     std::uint64_t realtime_speed_interval_vblanks{120u};
 };

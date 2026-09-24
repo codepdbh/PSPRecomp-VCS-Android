@@ -14,6 +14,10 @@
 #include "psprecomp/common.hpp"
 #include "psprecomp/deflate.hpp"
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -946,6 +950,12 @@ PartitionTable partition_table;
 CallbackTable callback_table;
 SemaphoreTable semaphore_table;
 EventFlagTable event_flag_table;
+struct TimedKernelWait {
+    std::uint64_t deadline_us{};
+    std::uint32_t timeout_address{};
+};
+std::unordered_map<std::int32_t, TimedKernelWait> timed_kernel_waits;
+psprecomp::GuestMemory *kernel_wait_memory{};
 FixedPoolTable fixed_pool_table;
 std::uint32_t compiled_sdk_version{};
 std::uint32_t compiler_version{};
@@ -2817,6 +2827,16 @@ void vcs_sprintf(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx) {
 bool maybe_start_pending_guest_callback(psprecomp::AllegrexContext &ctx);
 
 void enqueue_continuation(std::int32_t uid, const psprecomp::AllegrexContext &context) {
+    if (const auto wait = timed_kernel_waits.find(uid); wait != timed_kernel_waits.end()) {
+        if (kernel_wait_memory != nullptr &&
+            kernel_wait_memory->contains(wait->second.timeout_address, 4u)) {
+            const std::uint64_t remaining = wait->second.deadline_us > virtual_time_us
+                ? wait->second.deadline_us - virtual_time_us : 0u;
+            kernel_wait_memory->store32(wait->second.timeout_address,
+                static_cast<std::uint32_t>(std::min<std::uint64_t>(remaining, UINT32_MAX)));
+        }
+        timed_kernel_waits.erase(wait);
+    }
     auto thread = thread_table.threads.find(uid);
     if (thread != thread_table.threads.end()) {
         thread->second.state = ThreadState::Ready;
@@ -2907,6 +2927,46 @@ void promote_expired_delays() {
         const auto thread = thread_table.threads.find(item.uid);
         if (thread != thread_table.threads.end()) enqueue_continuation(item.uid, thread->second.suspended_context);
     }
+
+    std::vector<std::pair<std::uint64_t, std::int32_t>> expired_waits;
+    for (const auto &[uid, wait] : timed_kernel_waits) {
+        if (wait.deadline_us <= virtual_time_us)
+            expired_waits.emplace_back(wait.deadline_us, uid);
+    }
+    std::sort(expired_waits.begin(), expired_waits.end());
+    for (const auto &[deadline, uid] : expired_waits) {
+        (void)deadline;
+        const auto wait = timed_kernel_waits.find(uid);
+        if (wait == timed_kernel_waits.end()) continue;
+#if defined(__ANDROID__)
+        static std::uint32_t reported_wait_timeouts{};
+        if (reported_wait_timeouts++ < 24u)
+            __android_log_print(ANDROID_LOG_INFO, "VCSBoot",
+                "kernel wait timeout uid=%d deadline=%llu virtual_us=%llu",
+                uid, static_cast<unsigned long long>(wait->second.deadline_us),
+                static_cast<unsigned long long>(virtual_time_us));
+#endif
+        if (kernel_wait_memory != nullptr &&
+            kernel_wait_memory->contains(wait->second.timeout_address, 4u))
+            kernel_wait_memory->store32(wait->second.timeout_address, 0u);
+        timed_kernel_waits.erase(wait);
+        for (auto &[semaphore_uid, semaphore] : semaphore_table.semaphores) {
+            (void)semaphore_uid;
+            std::erase_if(semaphore.waiters,
+                [uid](const SemaphoreWaiter &item) { return item.uid == uid; });
+        }
+        for (auto &[flag_uid, flag] : event_flag_table.flags) {
+            (void)flag_uid;
+            std::erase_if(flag.waiters,
+                [uid](const EventFlagWaiter &item) { return item.uid == uid; });
+        }
+        if (const auto thread = thread_table.threads.find(uid);
+            thread != thread_table.threads.end() && thread->second.state == ThreadState::Sleeping) {
+            auto resume = thread->second.suspended_context;
+            resume.set_gpr(2, 0x800201A8u); // SCE_KERNEL_ERROR_WAIT_TIMEOUT
+            enqueue_continuation(uid, resume);
+        }
+    }
 }
 
 bool activate_next_thread(psprecomp::AllegrexContext &ctx, const char *reason) {
@@ -2925,6 +2985,10 @@ bool activate_next_thread(psprecomp::AllegrexContext &ctx, const char *reason) {
             (void)uid;
             if (thread.state == ThreadState::Delayed)
                 earliest = std::min(earliest, thread.delay_until_us);
+        }
+        for (const auto &[uid, wait] : timed_kernel_waits) {
+            (void)uid;
+            earliest = std::min(earliest, wait.deadline_us);
         }
         if (earliest != UINT64_MAX) {
             // The recomp runtime uses deterministic virtual PSP time.  When no
@@ -3079,10 +3143,41 @@ bool defer_current_thread_for_io_handoff(psprecomp::Runtime &runtime,
 bool suspend_current_thread(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx,
                             const psprecomp::AllegrexContext &suspended,
                             const std::string &reason) {
+#if defined(__ANDROID__)
+    static std::uint32_t android_block_logs{};
+    const bool android_report_block = android_block_logs++ < 96u;
+#endif
     if (auto current = thread_table.threads.find(thread_table.current_uid);
         current != thread_table.threads.end()) {
         current->second.state = ThreadState::Sleeping;
         current->second.suspended_context = suspended;
+#if defined(__ANDROID__)
+        if (android_report_block) {
+            __android_log_print(ANDROID_LOG_INFO, "VCSBoot",
+                "thread block uid=%d name=%s reason=%s resume=%08x dispatch=%08x args=%08x,%08x,%08x,%08x",
+                thread_table.current_uid, current->second.name.c_str(), reason.c_str(), suspended.pc,
+                psprecomp::runtime_dispatch_pc(), ctx.gpr[4], ctx.gpr[5], ctx.gpr[6], ctx.gpr[7]);
+            for (const auto &[semaphore_uid, semaphore] : semaphore_table.semaphores) {
+                for (const SemaphoreWaiter &waiter : semaphore.waiters) {
+                    if (waiter.uid == thread_table.current_uid) {
+                        __android_log_print(ANDROID_LOG_INFO, "VCSBoot",
+                            "wait semaphore uid=%d name=%s count=%d requested=%d",
+                            semaphore_uid, semaphore.name.c_str(), semaphore.count, waiter.requested);
+                    }
+                }
+            }
+            for (const auto &[flag_uid, flag] : event_flag_table.flags) {
+                for (const EventFlagWaiter &waiter : flag.waiters) {
+                    if (waiter.uid == thread_table.current_uid) {
+                        __android_log_print(ANDROID_LOG_INFO, "VCSBoot",
+                            "wait event uid=%d name=%s pattern=%08x requested=%08x mode=%08x",
+                            flag_uid, flag.name.c_str(), flag.current_pattern,
+                            waiter.requested, waiter.mode);
+                    }
+                }
+            }
+        }
+#endif
     }
     if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
         const auto found = thread_table.threads.find(thread_table.current_uid);
@@ -3187,6 +3282,7 @@ bool allocate_thread_stack(std::uint32_t stack_size, std::uint32_t &bottom, std:
 }
 
 void remove_thread_from_wait_queues(std::int32_t uid) {
+    timed_kernel_waits.erase(uid);
     for (auto &[semaphore_uid, semaphore] : semaphore_table.semaphores) {
         (void)semaphore_uid;
         semaphore.waiters.erase(std::remove_if(semaphore.waiters.begin(), semaphore.waiters.end(),
@@ -4132,6 +4228,9 @@ void report_realtime_speed_if_requested() {
                << " diagnosis=" << diagnosis << "\n";
     const std::string speed_text = speed_line.str();
     std::cerr.write(speed_text.data(), static_cast<std::streamsize>(speed_text.size()));
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "VCSSpeed", "%s", speed_text.c_str());
+#endif
 
     realtime_speed_stats.host_start = now;
     realtime_speed_stats.guest_start = virtual_time_us;
@@ -4229,7 +4328,16 @@ void limit_frame_rate() {
         const auto behind = std::chrono::duration_cast<std::chrono::microseconds>(
             now - target).count();
         if (behind > 0) {
+            // At a ~10 FPS Android software frame, four virtual periods cover
+            // only ~67 ms of a ~100 ms wall frame. Audio is then produced more
+            // slowly than AAudio consumes it, even though the guest's clock is
+            // meant to catch up. Eight periods cover that measured deficit
+            // while still bounding a single delayed frame.
+#if defined(__ANDROID__)
+            const std::uint64_t cap = virtual_vblank_period_us() * 8u;
+#else
             const std::uint64_t cap = virtual_vblank_period_us() * 4u;
+#endif
             virtual_time_us += std::min(static_cast<std::uint64_t>(behind), cap);
         }
         wall_anchor = now;
@@ -5271,6 +5379,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     callback_table = CallbackTable{};
     semaphore_table = SemaphoreTable{};
     event_flag_table = EventFlagTable{};
+    timed_kernel_waits.clear();
+    kernel_wait_memory = &runtime.memory();
     fixed_pool_table = FixedPoolTable{};
     loaded_modules.clear();
     next_module_uid = 0x400;
@@ -5460,6 +5570,15 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             rt.memory().store32(record.kernel_context + 0xF8u, 0xFFFFFFFFu);
             rt.memory().store32(record.kernel_context + 0xFCu, 0xFFFFFFFFu);
 
+#if defined(__ANDROID__)
+            static std::uint32_t android_created_threads{};
+            if (android_created_threads++ < 64u) {
+                __android_log_print(ANDROID_LOG_INFO, "VCSBoot",
+                    "thread create uid=%d name=%s entry=%08x priority=%u stack=%u",
+                    uid, record.name.c_str(), record.entry, record.priority, record.stack_size);
+            }
+#endif
+
             if (std::getenv("PSPRECOMP_TRACE") != nullptr || std::getenv("PSPRECOMP_THREAD_DIAG") != nullptr) {
                 std::cerr << "[sched] create uid=" << uid << " name=" << record.name
                           << " entry=" << psprecomp::hex32(record.entry)
@@ -5519,6 +5638,16 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             next.set_gpr(31, 0u);
             next.pc = thread.entry;
             enqueue_continuation(uid, next);
+
+#if defined(__ANDROID__)
+            static std::uint32_t android_started_threads{};
+            if (android_started_threads++ < 64u) {
+                __android_log_print(ANDROID_LOG_INFO, "VCSBoot",
+                    "thread start uid=%d name=%s entry=%08x priority=%u caller=%d",
+                    uid, thread.name.c_str(), thread.entry, thread.priority,
+                    thread_table.current_uid);
+            }
+#endif
 
             const std::int32_t caller_uid = thread_table.current_uid;
             const std::uint32_t caller_priority = thread_priority(caller_uid);
@@ -5905,6 +6034,39 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         });
 
     auto delay_thread = [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+#if defined(__ANDROID__)
+        static std::uint64_t android_delay_calls{};
+        static auto android_last_delay_log = std::chrono::steady_clock::now();
+        ++android_delay_calls;
+        const auto now = std::chrono::steady_clock::now();
+        if (android_delay_calls <= 12u || now - android_last_delay_log >= std::chrono::seconds(2)) {
+            android_last_delay_log = now;
+            const auto current = thread_table.threads.find(thread_table.current_uid);
+            __android_log_print(ANDROID_LOG_INFO, "VCSBoot",
+                "delay call=%llu uid=%d name=%s usec=%u virtual_us=%llu resume=%08x ready=%zu threads=%zu",
+                static_cast<unsigned long long>(android_delay_calls), thread_table.current_uid,
+                current != thread_table.threads.end() ? current->second.name.c_str() : "unknown",
+                ctx.gpr[4], static_cast<unsigned long long>(virtual_time_us), ctx.gpr[31],
+                thread_table.continuations.size(), thread_table.threads.size());
+            std::vector<std::int32_t> uids;
+            uids.reserve(thread_table.threads.size());
+            if (android_delay_calls <= 12u) {
+                for (const auto &[uid, thread] : thread_table.threads) {
+                    (void)thread;
+                    uids.push_back(uid);
+                }
+                std::sort(uids.begin(), uids.end());
+                for (const std::int32_t uid : uids) {
+                    const ThreadRecord &thread = thread_table.threads.at(uid);
+                    __android_log_print(ANDROID_LOG_INFO, "VCSBoot",
+                        "thread state uid=%d name=%s entry=%08x state=%u pc=%08x ra=%08x delay_until=%llu",
+                        uid, thread.name.c_str(), thread.entry, static_cast<unsigned>(thread.state),
+                        thread.suspended_context.pc, thread.suspended_context.gpr[31],
+                        static_cast<unsigned long long>(thread.delay_until_us));
+                }
+            }
+        }
+#endif
         (void)delay_current_thread(rt, ctx, ctx.gpr[4]);
     };
     runtime.register_hle("ThreadManForUser", 0xCEADEB47u, delay_thread);
@@ -6031,6 +6193,19 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             it->second.count -= amount;
             set_success(ctx);
             return;
+        }
+        if (ctx.gpr[6] != 0u) {
+            if (!rt.memory().contains(ctx.gpr[6], 4u)) {
+                ctx.set_gpr(2, 0x800200D3u);
+                return;
+            }
+            const std::uint32_t timeout_us = rt.memory().load32(ctx.gpr[6]);
+            if (timeout_us == 0u) {
+                ctx.set_gpr(2, 0x800201A8u);
+                return;
+            }
+            timed_kernel_waits[thread_table.current_uid] =
+                TimedKernelWait{virtual_time_us + timeout_us, ctx.gpr[6]};
         }
         const psprecomp::AllegrexContext suspended = make_wait_context(ctx);
         it->second.waiters.push_back(SemaphoreWaiter{thread_table.current_uid, suspended, amount});
@@ -6165,6 +6340,19 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             consume_event_flag(it->second, requested, mode);
             set_success(ctx);
             return;
+        }
+        if (ctx.gpr[8] != 0u) {
+            if (!rt.memory().contains(ctx.gpr[8], 4u)) {
+                ctx.set_gpr(2, 0x800200D3u);
+                return;
+            }
+            const std::uint32_t timeout_us = rt.memory().load32(ctx.gpr[8]);
+            if (timeout_us == 0u) {
+                ctx.set_gpr(2, 0x800201A8u);
+                return;
+            }
+            timed_kernel_waits[thread_table.current_uid] =
+                TimedKernelWait{virtual_time_us + timeout_us, ctx.gpr[8]};
         }
         const psprecomp::AllegrexContext suspended = make_wait_context(ctx);
         it->second.waiters.push_back(EventFlagWaiter{
@@ -6906,6 +7094,16 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         // wait only here before framebuffer presentation and vblank callbacks.
         if (!ge_async_wait_idle(rt)) return;
         ++display_vblank_index;
+#if defined(__ANDROID__)
+        if (display_vblank_index <= 3u || (display_vblank_index % 120u) == 0u) {
+            __android_log_print(ANDROID_LOG_INFO, "VCSBoot",
+                "vblank=%llu guest_us=%llu fb=%08x size=%ux%u stride=%u format=%u",
+                static_cast<unsigned long long>(display_vblank_index),
+                static_cast<unsigned long long>(virtual_time_us), display_state.frame_buffer,
+                display_state.width, display_state.height, display_state.buffer_width,
+                display_state.pixel_format);
+        }
+#endif
         vcs::audio_output_advance(virtual_time_us);
         report_realtime_speed_if_requested();
         if (frame_time_diag_enabled()) {
@@ -7066,6 +7264,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         if (gpu_frame_ready) {
             holding_gpu_frame = true;
             vblanks_since_gpu_frame = 0u;
+        } else if (ge_gpu_backend_report().software_fallback_frame) {
+            holding_gpu_frame = false;
         } else if (holding_gpu_frame && ++vblanks_since_gpu_frame > 4u) {
             holding_gpu_frame = false;
         }
@@ -8509,6 +8709,29 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             std::vector<std::uint8_t> frame(frame_bytes);
             if (!read_video_frame(state->second, frame)) {
+                // No video backend on this host (the Android build has none yet),
+                // as opposed to a stream that opened and ran out. Failing the
+                // decode here is fatal to the boot: VCS's player loop returns on
+                // the first decode error and its teardown then waits in
+                // sceKernelWaitThreadEnd for MPEGdisplayThread/MPEGsoundThread,
+                // which are still parked on their start semaphores because
+                // nothing told them to quit - a permanent deadlock on LOGO.PMF.
+                //
+                // So end the movie the way a finished one ends instead: hand back
+                // one black frame as a successful decode, and empty the ring. The
+                // next GetAvcAu/GetAtracAu sees ring+12 at zero and reports no
+                // data (0x80618001), which is the game's normal end-of-movie path
+                // and shuts the player threads down properly.
+                if (!state->second.video.is_open()) {
+                    rt.memory().zero(destination, static_cast<std::uint32_t>(destination_bytes));
+                    const std::uint32_t ring = state->second.ring_address;
+                    if (ring != 0u && rt.memory().contains(ring, 48u))
+                        rt.memory().store32(ring + 12u, 0u);
+                    state->second.video_eof = true;
+                    rt.memory().store32(status_pointer, 1u);
+                    set_success(ctx);
+                    return;
+                }
                 rt.memory().store32(status_pointer, 0u);
                 ctx.set_gpr(2, 0x80628002u);
                 return;
