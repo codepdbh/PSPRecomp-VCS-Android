@@ -4,47 +4,96 @@
 
 <h1 align="center">PSPRecomp · Vice City Stories</h1>
 
-<p align="center">Port experimental de Grand Theft Auto: Vice City Stories para Windows y Android ARM64, basado en recompilación estática de código PSP.</p>
+<p align="center">Port experimental de Grand Theft Auto: Vice City Stories para Android ARM64 y Windows, basado en recompilación estática del código de PSP.</p>
 
 <p align="center">
   <img alt="C++20" src="https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white" />
+  <img alt="Android ARM64 Vulkan" src="https://img.shields.io/badge/Android-ARM64%20%C2%B7%20Vulkan-3DDC84?logo=android&logoColor=white" />
   <img alt="Windows DirectX 12" src="https://img.shields.io/badge/Windows-DirectX%2012-0078D4?logo=windows&logoColor=white" />
-  <img alt="Android ARM64" src="https://img.shields.io/badge/Android-ARM64-3DDC84?logo=android&logoColor=white" />
-  <img alt="Estado experimental" src="https://img.shields.io/badge/estado-experimental-orange" />
+  <img alt="Estado beta" src="https://img.shields.io/badge/estado-beta%200.1.0-orange" />
 </p>
 
-> **Estado actual:** el juego arranca y muestra gameplay en Windows y en un Galaxy S25 Ultra. En Android todavía hay caídas de rendimiento y defectos gráficos; la configuración segura usa el rasterizador software. Vulkan ya dibuja en GPU el framebuffer del mundo y su composición en un modo experimental, pero aún requiere corregir la imagen y comprobar el menú de pausa antes de usarlo como predeterminado.
+> **Estado actual (beta 0.1.0):** el juego se juega en Android con render por GPU (Vulkan), en HD o a la resolución nativa de la pantalla, en pantalla completa widescreen y con audio. Todavía hay caídas de rendimiento en resoluciones altas y detalles pendientes (ver [Problemas conocidos](#problemas-conocidos)).
 
 ## El proyecto
 
-[PSPRecomp](https://github.com/jessicanataliagta/PSPRecomp) traduce código Allegrex a C++ nativo. Este repositorio añade el perfil VCS, los servicios de host para Windows y Android, y la aplicación ARM64. El código fuente del juego se recompila; los datos comerciales se cargan desde una copia local del usuario.
+[PSPRecomp](https://github.com/jessicanataliagta/PSPRecomp) traduce el código Allegrex de la PSP a C++ nativo. Este repositorio añade el perfil de VCS, los servicios de plataforma para Android y Windows, y la app Android. El código del juego se recompila; los datos del juego se leen de una copia propia del usuario.
 
-| Componente | Estado |
-| --- | --- |
-| Host Windows | Juego renderizado con DirectX 12 |
-| App Android ARM64 | Arranque, imagen, audio y controles táctiles en desarrollo |
-| Renderizador Android actual | Software, compilado con optimizaciones Release |
-| Backend Vulkan Android | Dos pases para mundo y pantalla, con texturas RGBA, alpha test, niebla y profundidad D16; experimental |
-| Rendimiento y paridad visual Android | Trabajo en curso; requiere más pruebas en el dispositivo |
+## Instalación en Android
 
-## Android
+### 1. Requisitos
 
-Requisitos: Android SDK, NDK `28.2.13676358`, CMake `3.22.1`, Java compatible con Gradle 8.11.1 y un dispositivo ARM64 autorizado para ADB.
+- Android 8.0 o superior, procesador **ARM64** y soporte Vulkan (probado en un Samsung Galaxy S25 Ultra).
+- Tu propia copia de **GTA: Vice City Stories para PSP (USA, ULUS10160)**, preparada con [setup_vcs.ps1](setup_vcs.ps1). Ese paso extrae los datos y genera el ELF descifrado.
 
-Desde PowerShell, en la raíz del repositorio:
+### 2. Copia los datos del juego a la carpeta `VCS`
+
+Los datos van en una carpeta llamada exactamente **`VCS`** (en mayúsculas) en la **raíz del almacenamiento interno** del teléfono, es decir, `/storage/emulated/0/VCS`. Dentro tiene que quedar la carpeta `PSP_GAME` del juego:
+
+```text
+Almacenamiento interno/
+└── VCS/
+    └── PSP_GAME/
+        ├── SYSDIR/
+        │   └── EBOOT_DECRYPTED.ELF
+        └── USRDIR/
+            └── RUNDATA/ …   (resto de los datos del juego)
+```
+
+Puedes copiarla con un explorador de archivos, por USB o con ADB:
+
+```powershell
+adb shell mkdir -p /storage/emulated/0/VCS
+adb push --sync profiles\vcs\game\PSP_GAME /storage/emulated/0/VCS/
+```
+
+Si la app no encuentra `VCS/PSP_GAME/SYSDIR/EBOOT_DECRYPTED.ELF`, lo avisa en pantalla al abrirla.
+
+### 3. Instala y abre la app
+
+1. Descarga el APK desde [Releases](https://github.com/codepdbh/PSPRecomp-VCS-Android/releases) e instálalo.
+2. Al abrirla por primera vez, concede el permiso **"Acceso a todos los archivos"**; sin él no puede leer la carpeta `VCS`. Luego vuelve a abrir la app.
+3. La primera carga tarda un poco más.
+
+### Ajustes (botón ⚙ en pantalla)
+
+- **Resolución interna:** HD, Full HD o nativa de la pantalla. Se aplica al reiniciar la app.
+- **Editar posición de controles:** arrastra cada grupo de botones y ajusta su tamaño con − / +.
+- **Restablecer controles:** vuelve al diseño original.
+
+La configuración avanzada vive en `VCSNative.ini`, dentro de los archivos privados de la app.
+
+### Controles
+
+- **Táctil:** joystick flotante (aparece donde apoyas el pulgar), cruceta, △ ○ ✕ □, L, R, SELECT y START.
+- **Mando Bluetooth/USB:** A = ✕, B = ○, X = □, Y = △, L1/L2 = L, R1/R2 = R, Start, Select, cruceta y stick izquierdo.
+- **Teclado y ratón:** WASD para moverse (Alt para caminar), Espacio, Shift, F/Enter, Q/E, H, flechas, Esc (pausa) y Tab; clic izquierdo dispara, clic derecho apunta y el botón central mira atrás.
+
+Al usar un mando, un teclado o un ratón, los controles táctiles se ocultan; vuelven al tocar la pantalla.
+
+### Problemas conocidos
+
+- En resoluciones altas el juego no siempre llega a velocidad completa. Si va lento, baja a HD desde ⚙.
+- Los videos de introducción se saltan (pantalla negra): falta el decodificador de video para Android.
+- El ratón todavía no mueve la cámara; sus botones sí funcionan.
+- El APK beta está firmado con una clave de depuración.
+
+## Compilar
+
+### Android
+
+Requisitos: Android SDK, NDK `28.2.13676358`, CMake `3.22.1`, Java compatible con Gradle 8.11.1 y un dispositivo ARM64 autorizado para ADB. Desde PowerShell, en la raíz del repositorio:
 
 ```powershell
 ./build_android.ps1
 ./run_android.ps1
 ```
 
-La app espera los datos extraídos de una copia propia en **Memoria interna/VCS** (`/storage/emulated/0/VCS`). El ELF descifrado debe estar en `VCS/PSP_GAME/SYSDIR/EBOOT_DECRYPTED.ELF`. La app requiere permiso de acceso a archivos para leer esa carpeta. El APK no incluye datos del juego.
+Consulta [Vulkan en Android](docs/ANDROID_VULKAN.md) y el [análisis de portabilidad](docs/ANDROID_PORT_ANALYSIS.md) para los detalles técnicos.
 
-Consulta [Vulkan en Android](docs/ANDROID_VULKAN.md) para conocer el estado técnico y las limitaciones del nuevo backend, y el [análisis de portabilidad](docs/ANDROID_PORT_ANALYSIS.md) para el mapa de componentes.
+### Windows
 
-## Windows
-
-Requisitos: Visual Studio 2022 con C++, Windows SDK, CMake y archivos de una copia propia del juego.
+Requisitos: Visual Studio 2022 con C++, Windows SDK, CMake y los archivos de una copia propia del juego.
 
 ```powershell
 ./build_vcs.ps1
@@ -55,6 +104,6 @@ La preparación local está en [setup_vcs.ps1](setup_vcs.ps1) y [prepare_game.ps
 
 ## Datos y distribución
 
-Este repositorio publica **solo código fuente**. No hay APK en Releases. No subas ISOs, EBOOTs, ELF descifrados, partidas ni recursos comerciales. Cada usuario debe aportar sus propios archivos del juego.
+El repositorio y los APK de Releases contienen **solo el programa**, sin ningún dato del juego. No subas ISOs, EBOOTs, ELF descifrados, partidas ni recursos comerciales: cada usuario debe aportar sus propios archivos.
 
 El framework PSPRecomp usa licencia MIT. Las licencias y avisos adicionales del perfil están en [THIRD_PARTY.md](profiles/vcs/THIRD_PARTY.md). Proyecto comunitario no oficial, sin afiliación con Rockstar Games ni Sony Interactive Entertainment.
