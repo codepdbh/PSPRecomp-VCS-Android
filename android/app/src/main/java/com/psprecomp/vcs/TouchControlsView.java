@@ -148,6 +148,10 @@ final class TouchControlsView extends View {
     private final RectF[] groupBounds = new RectF[G_COUNT];
     private final SharedPreferences prefs;
 
+    // Hidden while a physical controller is in use; the next touch brings the
+    // controls back (and is swallowed, so it does not also press something).
+    private boolean hidden;
+
     // Editor state.
     private boolean editMode;
     private int selectedGroup = G_FACE;
@@ -326,6 +330,14 @@ final class TouchControlsView extends View {
         return editMode;
     }
 
+    /** Called when a gamepad is used: get the touch controls out of the way. */
+    void hideForController() {
+        if (hidden || editMode) return;
+        releaseAll();
+        hidden = true;
+        invalidate();
+    }
+
     void setEditMode(boolean editing) {
         if (editMode == editing) return;
         releaseAll();
@@ -420,6 +432,13 @@ final class TouchControlsView extends View {
     // --- Touch -----------------------------------------------------------------------------
 
     @Override public boolean onTouchEvent(MotionEvent event) {
+        if (hidden) {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                hidden = false;
+                invalidate();
+            }
+            return true;
+        }
         if (editMode) {
             editTouch(event);
             invalidate();
@@ -569,6 +588,7 @@ final class TouchControlsView extends View {
 
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
+        if (hidden) return;
         if (editMode) {
             fill.setStyle(Paint.Style.FILL);
             fill.setColor(0x66000000);

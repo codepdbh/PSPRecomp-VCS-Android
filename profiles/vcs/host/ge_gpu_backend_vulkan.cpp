@@ -65,6 +65,11 @@ struct VulkanPreview {
     bool enabled{};
     bool authoritative{};
     bool software_menu_active{};
+    // A 3D (non-through, non-clear) draw has been seen since the last vblank.
+    // Menus draw none; they also double-buffer between two surfaces every
+    // vblank, one of which is the gameplay world target, so the address alone
+    // cannot tell a menu frame from a gameplay one.
+    bool frame_has_scene{};
     unsigned consecutive_2d_frames{};
     VkInstance instance{VK_NULL_HANDLE};
     VkPhysicalDevice physical{VK_NULL_HANDLE};
@@ -973,8 +978,10 @@ void ge_gpu_backend_record_draw(const GeGpuDrawDescriptor &draw) noexcept {
     ++s.report.draw_calls;
     s.report.vertices += draw.vertex_count;
     if (s.authoritative && !draw.through && !draw.clear_mode &&
-        (draw.framebuffer_address & 0x001FFFF0u) != s.display_framebuffer)
+        (draw.framebuffer_address & 0x001FFFF0u) != s.display_framebuffer) {
         s.world_framebuffer_address = draw.framebuffer_address & 0x001FFFF0u;
+        s.frame_has_scene = true;
+    }
 }
 void ge_gpu_backend_observe_camera(const std::array<float, 12> &,
                                    const std::array<float, 16> &,
@@ -1039,8 +1046,9 @@ GeGpuWidescreenHud ge_gpu_backend_widescreen_hud(const GeGpuDrawDescriptor &draw
     if (!std::isfinite(shrink) || shrink <= 0.0f || std::abs(shrink - 1.0f) < 1.0e-5f) return hud;
     // The HUD is drawn into the 512-wide world surface, which the composition
     // maps onto the 480-wide display.
-    const bool world = s.world_framebuffer_address != 0u &&
-        (draw.framebuffer_address & 0x001FFFF0u) == s.world_framebuffer_address;
+    const std::uint32_t target = draw.framebuffer_address & 0x001FFFF0u;
+    const bool world = s.frame_has_scene && s.world_framebuffer_address != 0u &&
+        target == s.world_framebuffer_address;
     const std::uint32_t logical_width = world ? kWorldWidth : kWidth;
     hud.shrink = shrink;
     hud.display_scale_x = static_cast<float>(kWidth) / static_cast<float>(logical_width);
@@ -1233,13 +1241,26 @@ bool ge_gpu_backend_accumulate_hardware_packed_0115(const GeGpuDrawDescriptor &,
     std::span<const std::uint32_t>) noexcept { return false; }
 void ge_gpu_backend_set_native_window(void *) noexcept {}
 void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept {
-    state().display_framebuffer = address & 0x001FFFF0u;
+    auto &s = state();
+    const std::uint32_t masked = address & 0x001FFFF0u;
+    if (masked != s.display_framebuffer) {
+        static unsigned logged_switches = 0u;
+        if (logged_switches < 60u) {
+            ++logged_switches;
+            __android_log_print(ANDROID_LOG_INFO, "VCSVulkan", "display framebuffer %05x -> %05x (world %05x)",
+                                s.display_framebuffer, masked, s.world_framebuffer_address);
+        }
+    }
+    s.display_framebuffer = masked;
 }
 
 bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     VulkanPreview &s = state();
     s.report.software_fallback_frame = s.software_menu_active;
-    if (!s.enabled || s.batches.empty()) return false;
+    if (!s.enabled || s.batches.empty()) {
+        s.frame_has_scene = false;
+        return false;
+    }
     const bool has_scene_draws = std::any_of(s.batches.begin(), s.batches.end(),
         [](const DrawBatch &batch) {
             return !batch.draw.through && !batch.draw.clear_mode;
@@ -1319,9 +1340,28 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                                   batch.framebuffer_feedback});
             }
         };
-        if (s.authoritative && s.world_framebuffer_address != 0u)
-            select_target(s.world_framebuffer_address, world_batches);
-        select_target(s.display_framebuffer, display_batches);
+        if (has_scene_draws) {
+            // Gameplay: the world pass, then the composition into the display.
+            if (s.authoritative && s.world_framebuffer_address != 0u &&
+                s.world_framebuffer_address != s.display_framebuffer)
+                select_target(s.world_framebuffer_address, world_batches);
+            select_target(s.display_framebuffer, display_batches);
+        } else {
+            // 2D-only frame (menus, the composition-only vblank). Menus
+            // double-buffer between two surfaces every vblank, so the one the
+            // guest happens to be displaying is not the one it just drew:
+            // present whichever target received this frame's draws.
+            std::uint32_t best = s.display_framebuffer;
+            std::size_t best_count = 0u;
+            for (const DrawBatch &candidate : s.batches) {
+                const std::uint32_t address = candidate.draw.framebuffer_address & 0x001FFFF0u;
+                std::size_t count = 0u;
+                for (const DrawBatch &other : s.batches)
+                    if ((other.draw.framebuffer_address & 0x001FFFF0u) == address) ++count;
+                if (count > best_count) { best = address; best_count = count; }
+            }
+            select_target(best, display_batches);
+        }
     } catch (...) {
         s.vertices.clear();
         s.batches.clear();
@@ -1329,22 +1369,20 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     }
     s.vertices.clear();
     s.batches.clear();
+    s.frame_has_scene = false;
     if (selected.empty() || display_batches.empty() ||
         selected.size() * sizeof(GeGpuVertex) > kVertexCapacity) return false;
-    if (s.authoritative) {
-        if (!has_scene_draws) {
-            // Menus are rendered with through-mode 2D commands. Wait for a
-            // second such frame before switching, since gameplay can have one
-            // HUD-only vblank between two world frames.
-            s.consecutive_2d_frames = std::min(s.consecutive_2d_frames + 1u, 2u);
-            if (s.consecutive_2d_frames == 2u) s.software_menu_active = true;
-            s.report.software_fallback_frame = s.software_menu_active;
-            return false;
-        }
-        s.consecutive_2d_frames = 0u;
-        s.software_menu_active = false;
-        s.report.software_fallback_frame = false;
-    }
+    // Menus are rendered here too. They used to be handed back to the software
+    // rasterizer after two 2D-only frames, but the CPU raster of the surface
+    // the menu draws into is skipped while the GPU owns it - so the picture
+    // switched between a GPU frame and a half-painted guest framebuffer
+    // (garbled menu text, unstable pause menu), and at 480x272 stretched to
+    // the panel. Drawing them on the GPU keeps one source, in HD, with the
+    // same widescreen HUD correction as gameplay.
+    (void)has_scene_draws;
+    s.consecutive_2d_frames = 0u;
+    s.software_menu_active = false;
+    s.report.software_fallback_frame = false;
     std::memcpy(s.vertices_gpu.mapped, selected.data(), selected.size() * sizeof(GeGpuVertex));
     VkResult result = vkResetCommandPool(s.device, s.command_pool, 0u);
     if (result != VK_SUCCESS) { log_error("vkResetCommandPool", result); return false; }

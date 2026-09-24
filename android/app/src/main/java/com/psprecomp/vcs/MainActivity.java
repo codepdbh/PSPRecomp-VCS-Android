@@ -14,6 +14,9 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
+import android.view.InputDevice;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -48,6 +51,16 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private boolean surfaceReady, startRequested, permissionPrompted;
     private long gameStartAt;
     private int panelWidth, panelHeight;
+
+    // Touch and physical-controller state, merged in pushInput(): either can
+    // drive the game, and a pad does not have to fight the touch overlay.
+    private int touchButtons, touchAnalogX = 128, touchAnalogY = 128;
+    private int padButtons, padHatButtons;
+    private float padStickX, padStickY;
+    private static final float PAD_DEAD_ZONE = 0.18f;
+    // Hardware keyboard and mouse, bound like the desktop host (display_window.cpp).
+    private int keyboardButtons, mouseButtons;
+    private boolean keyW, keyA, keyS, keyD, keyWalk;
     private final Handler handler = new Handler();
     private final Runnable statusPoll = new Runnable() {
         @Override public void run() {
@@ -91,7 +104,10 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         controls = new TouchControlsView(this, new TouchControlsView.Listener() {
             @Override public void onInput(int buttons, int analogX, int analogY,
                                           boolean accelerate, boolean brake) {
-                nativeSetInput(buttons, analogX, analogY, accelerate, brake);
+                touchButtons = buttons;
+                touchAnalogX = analogX;
+                touchAnalogY = analogY;
+                pushInput();
             }
             @Override public void onSettingsRequested() {
                 showSettingsDialog();
@@ -144,6 +160,9 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     @Override protected void onPause() {
         // Nothing may stay held while the app is in the background.
+        padButtons = padHatButtons = keyboardButtons = mouseButtons = 0;
+        padStickX = padStickY = 0f;
+        keyW = keyA = keyS = keyD = keyWalk = false;
         if (controls != null) controls.releaseAll();
         super.onPause();
     }
@@ -172,6 +191,184 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         startRequested = true;
         gameStartAt = SystemClock.uptimeMillis();
         nativeStartGame(gameRoot.getAbsolutePath(), getFilesDir().getAbsolutePath());
+    }
+
+    // --- Physical controllers --------------------------------------------------------------
+
+    private void pushInput() {
+        int buttons = touchButtons | padButtons | padHatButtons | keyboardButtons | mouseButtons;
+        int ax = touchAnalogX, ay = touchAnalogY;
+        float magnitude = (float) Math.sqrt(padStickX * padStickX + padStickY * padStickY);
+        if (keyW || keyA || keyS || keyD) {
+            // WASD drives the analog stick, as on the desktop; Alt walks.
+            float kx = (keyD ? 1f : 0f) - (keyA ? 1f : 0f);
+            float ky = (keyS ? 1f : 0f) - (keyW ? 1f : 0f);
+            float reach = keyWalk ? 60f : 127f;
+            float length = (float) Math.sqrt(kx * kx + ky * ky);
+            if (length > 0f) {
+                ax = Math.round(128f + kx / length * reach);
+                ay = Math.round(128f + ky / length * reach);
+            }
+        } else if (magnitude > PAD_DEAD_ZONE) {
+            // Rescale past the dead zone so the edge of it reads as zero, not a jump.
+            float scaled = Math.min(1f, (magnitude - PAD_DEAD_ZONE) / (1f - PAD_DEAD_ZONE));
+            ax = Math.round(128f + padStickX / magnitude * scaled * 127f);
+            ay = Math.round(128f + padStickY / magnitude * scaled * 127f);
+        }
+        ax = Math.max(0, Math.min(255, ax));
+        ay = Math.max(0, Math.min(255, ay));
+        nativeSetInput(buttons, ax, ay,
+            (buttons & TouchControlsView.PSP_CROSS) != 0, (buttons & TouchControlsView.PSP_SQUARE) != 0);
+    }
+
+    private static boolean isController(InputDevice device, int source) {
+        int sources = device != null ? device.getSources() : source;
+        return (sources & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+               (sources & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
+    }
+
+    /** Standard Android gamepad keys, mapped by position to the PSP pad. */
+    private static int padMask(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_BUTTON_A: return TouchControlsView.PSP_CROSS;
+            case KeyEvent.KEYCODE_BUTTON_B: return TouchControlsView.PSP_CIRCLE;
+            case KeyEvent.KEYCODE_BUTTON_X: return TouchControlsView.PSP_SQUARE;
+            case KeyEvent.KEYCODE_BUTTON_Y: return TouchControlsView.PSP_TRIANGLE;
+            case KeyEvent.KEYCODE_BUTTON_L1:
+            case KeyEvent.KEYCODE_BUTTON_L2: return TouchControlsView.PSP_L;
+            case KeyEvent.KEYCODE_BUTTON_R1:
+            case KeyEvent.KEYCODE_BUTTON_R2: return TouchControlsView.PSP_R;
+            case KeyEvent.KEYCODE_BUTTON_START: return TouchControlsView.PSP_START;
+            case KeyEvent.KEYCODE_BUTTON_SELECT: return TouchControlsView.PSP_SELECT;
+            case KeyEvent.KEYCODE_DPAD_UP: return TouchControlsView.PSP_UP;
+            case KeyEvent.KEYCODE_DPAD_DOWN: return TouchControlsView.PSP_DOWN;
+            case KeyEvent.KEYCODE_DPAD_LEFT: return TouchControlsView.PSP_LEFT;
+            case KeyEvent.KEYCODE_DPAD_RIGHT: return TouchControlsView.PSP_RIGHT;
+            default: return 0;
+        }
+    }
+
+    /** Keyboard bindings from the desktop host (kKeyBindings in display_window.cpp). */
+    private static int keyboardMask(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_SPACE: return TouchControlsView.PSP_CROSS;       // sprint / handbrake
+            case KeyEvent.KEYCODE_SHIFT_LEFT:
+            case KeyEvent.KEYCODE_SHIFT_RIGHT: return TouchControlsView.PSP_SQUARE; // jump / brake
+            case KeyEvent.KEYCODE_F:
+            case KeyEvent.KEYCODE_ENTER: return TouchControlsView.PSP_TRIANGLE;    // enter / exit vehicle
+            case KeyEvent.KEYCODE_Q: return TouchControlsView.PSP_LEFT;            // previous weapon / station
+            case KeyEvent.KEYCODE_E: return TouchControlsView.PSP_RIGHT;           // next weapon / station
+            case KeyEvent.KEYCODE_H: return TouchControlsView.PSP_L;               // horn
+            case KeyEvent.KEYCODE_DPAD_UP: return TouchControlsView.PSP_UP;
+            case KeyEvent.KEYCODE_DPAD_DOWN: return TouchControlsView.PSP_DOWN;
+            case KeyEvent.KEYCODE_DPAD_LEFT: return TouchControlsView.PSP_LEFT;
+            case KeyEvent.KEYCODE_DPAD_RIGHT: return TouchControlsView.PSP_RIGHT;
+            case KeyEvent.KEYCODE_ESCAPE: return TouchControlsView.PSP_START;      // pause
+            case KeyEvent.KEYCODE_TAB: return TouchControlsView.PSP_SELECT;
+            default: return 0;
+        }
+    }
+
+    private boolean handleKeyboard(KeyEvent event) {
+        boolean down = event.getAction() == KeyEvent.ACTION_DOWN;
+        if (event.getAction() != KeyEvent.ACTION_DOWN && event.getAction() != KeyEvent.ACTION_UP) return false;
+        switch (event.getKeyCode()) {
+            case KeyEvent.KEYCODE_W: keyW = down; break;
+            case KeyEvent.KEYCODE_A: keyA = down; break;
+            case KeyEvent.KEYCODE_S: keyS = down; break;
+            case KeyEvent.KEYCODE_D: keyD = down; break;
+            case KeyEvent.KEYCODE_ALT_LEFT:
+            case KeyEvent.KEYCODE_ALT_RIGHT: keyWalk = down; break;
+            default: {
+                int mask = keyboardMask(event.getKeyCode());
+                if (mask == 0) return false;
+                if (down) keyboardButtons |= mask; else keyboardButtons &= ~mask;
+            }
+        }
+        if (down) controls.hideForController();
+        pushInput();
+        return true;
+    }
+
+    private static boolean isHardwareKeyboard(KeyEvent event) {
+        InputDevice device = event.getDevice();
+        return device != null && !device.isVirtual() &&
+               (event.getSource() & InputDevice.SOURCE_KEYBOARD) == InputDevice.SOURCE_KEYBOARD &&
+               device.getKeyboardType() == InputDevice.KEYBOARD_TYPE_ALPHABETIC;
+    }
+
+    @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        if (controls.isEditing()) return super.dispatchKeyEvent(event);
+        if (!isController(event.getDevice(), event.getSource()) && isHardwareKeyboard(event) &&
+            handleKeyboard(event)) return true;
+        int mask = padMask(event.getKeyCode());
+        if (mask != 0 && isController(event.getDevice(), event.getSource()) && !controls.isEditing()) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                padButtons |= mask;
+                controls.hideForController();
+            } else if (event.getAction() == KeyEvent.ACTION_UP) {
+                padButtons &= ~mask;
+            }
+            pushInput();
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    /** Mouse buttons follow the desktop host: fire left, aim right, look behind middle. */
+    private boolean handleMouse(MotionEvent event) {
+        int state = event.getButtonState();
+        int buttons = 0;
+        if ((state & MotionEvent.BUTTON_PRIMARY) != 0) buttons |= TouchControlsView.PSP_CIRCLE;
+        if ((state & MotionEvent.BUTTON_SECONDARY) != 0) buttons |= TouchControlsView.PSP_R;
+        if ((state & MotionEvent.BUTTON_TERTIARY) != 0) buttons |= TouchControlsView.PSP_L;
+        if (buttons != 0) controls.hideForController();
+        if (buttons != mouseButtons) {
+            mouseButtons = buttons;
+            pushInput();
+        }
+        return true;
+    }
+
+    @Override public boolean dispatchTouchEvent(MotionEvent event) {
+        // A mouse click arrives as a touch; keep it away from the on-screen pad.
+        if (event.getPointerCount() > 0 && event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE &&
+            !controls.isEditing())
+            return handleMouse(event);
+        return super.dispatchTouchEvent(event);
+    }
+
+    @Override public boolean dispatchGenericMotionEvent(MotionEvent event) {
+        if ((event.getSource() & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE &&
+            !controls.isEditing()) {
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_BUTTON_PRESS || action == MotionEvent.ACTION_BUTTON_RELEASE)
+                return handleMouse(event);
+        }
+        if (isController(event.getDevice(), event.getSource()) &&
+            event.getActionMasked() == MotionEvent.ACTION_MOVE && !controls.isEditing()) {
+            padStickX = event.getAxisValue(MotionEvent.AXIS_X);
+            padStickY = event.getAxisValue(MotionEvent.AXIS_Y);
+            // Many pads report the D-pad as a hat axis rather than as keys.
+            float hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X);
+            float hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y);
+            int hat = 0;
+            if (hatX < -0.5f) hat |= TouchControlsView.PSP_LEFT;
+            if (hatX > 0.5f) hat |= TouchControlsView.PSP_RIGHT;
+            if (hatY < -0.5f) hat |= TouchControlsView.PSP_UP;
+            if (hatY > 0.5f) hat |= TouchControlsView.PSP_DOWN;
+            // Analog triggers on pads that send no L2/R2 key events.
+            if (event.getAxisValue(MotionEvent.AXIS_LTRIGGER) > 0.5f ||
+                event.getAxisValue(MotionEvent.AXIS_BRAKE) > 0.5f) hat |= TouchControlsView.PSP_L;
+            if (event.getAxisValue(MotionEvent.AXIS_RTRIGGER) > 0.5f ||
+                event.getAxisValue(MotionEvent.AXIS_GAS) > 0.5f) hat |= TouchControlsView.PSP_R;
+            padHatButtons = hat;
+            if (hat != 0 || Math.abs(padStickX) > PAD_DEAD_ZONE || Math.abs(padStickY) > PAD_DEAD_ZONE)
+                controls.hideForController();
+            pushInput();
+            return true;
+        }
+        return super.dispatchGenericMotionEvent(event);
     }
 
     // --- Resolution ------------------------------------------------------------------------
