@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory=$true)][string]$ExtractedUmdRoot,
     [string]$DecryptedElf = "",
     [string]$Destination = "$PSScriptRoot\..\game",
+    [switch]$DataOnly,
     [switch]$AllowUnverifiedElf
 )
 $ErrorActionPreference = "Stop"
@@ -13,8 +14,48 @@ if (!(Test-Path $paramSfo)) {
     throw "PARAM.SFO not found. Provide an extracted PSP game directory."
 }
 
+# Validate the identity before copying into (and potentially replacing) the
+# ignored local game directory. SFO keys are binary-offset based, not strings
+# at a fixed position, so read the standard PSF table explicitly.
+$sfo = [System.IO.File]::ReadAllBytes($paramSfo)
+if ($sfo.Length -lt 20 -or [System.Text.Encoding]::ASCII.GetString($sfo, 0, 4) -ne "`0PSF") {
+    throw "PARAM.SFO is not a valid PSP SFO file."
+}
+$keyTable = [BitConverter]::ToUInt32($sfo, 8)
+$dataTable = [BitConverter]::ToUInt32($sfo, 12)
+$entryCount = [BitConverter]::ToUInt32($sfo, 16)
+$discId = $null
+for ($i = 0; $i -lt $entryCount; $i++) {
+    $entryOffset = 20 + 16 * $i
+    if ($entryOffset + 16 -gt $sfo.Length) { throw "PARAM.SFO entry table is truncated." }
+    $keyOffset = [BitConverter]::ToUInt16($sfo, $entryOffset)
+    $dataLength = [BitConverter]::ToUInt32($sfo, $entryOffset + 8)
+    $valueOffset = [BitConverter]::ToUInt32($sfo, $entryOffset + 12)
+    $keyStart = [int]$keyTable + $keyOffset
+    $keyEnd = $keyStart
+    while ($keyEnd -lt $sfo.Length -and $sfo[$keyEnd] -ne 0) { $keyEnd++ }
+    $key = [System.Text.Encoding]::ASCII.GetString($sfo, $keyStart, $keyEnd - $keyStart)
+    if ($key -eq "DISC_ID") {
+        $valueStart = [int]$dataTable + [int]$valueOffset
+        if ($valueStart + $dataLength -gt $sfo.Length) { throw "PARAM.SFO DISC_ID value is truncated." }
+        $discId = [System.Text.Encoding]::ASCII.GetString($sfo, $valueStart, [int]$dataLength).TrimEnd([char]0)
+        break
+    }
+}
+if ($discId -notmatch '^ULUS-?10160$') {
+    throw "Unsupported VCS disc ID '$discId'. Expected ULUS10160; destination was not modified."
+}
+
 New-Item -ItemType Directory -Force $Destination | Out-Null
-Copy-Item -Recurse -Force $pspGame $Destination
+$destinationRoot = (Resolve-Path $Destination).Path
+$destinationPspGame = Join-Path $destinationRoot "PSP_GAME"
+if ([System.IO.Path]::GetFullPath($pspGame) -ne [System.IO.Path]::GetFullPath($destinationPspGame)) {
+    Copy-Item -Recurse -Force $pspGame $destinationRoot
+}
+if ($DataOnly) {
+    Write-Host "Prepared VCS game data only: $Destination"
+    return
+}
 
 $sourceElf = $null
 if ($DecryptedElf -ne "") {
@@ -42,7 +83,11 @@ if ($elfBytes.Length -lt 4 -or $elfBytes[0] -ne 0x7F -or $elfBytes[1] -ne 0x45 -
     throw "The supplied executable is not an ELF file."
 }
 
-$expectedSha256 = "fee2e86c7fe457ab6da463d9fdc16f156a0900adcdaa2fd260206c11907c5d65"
+$profileConfig = Join-Path $PSScriptRoot "..\config\vcs_ulus10160.toml"
+$configText = Get-Content -Raw $profileConfig
+$hashMatch = [regex]::Match($configText, '(?m)^expected_sha256\s*=\s*"([0-9a-fA-F]{64})"')
+if (!$hashMatch.Success) { throw "Profile config has no valid expected_sha256: $profileConfig" }
+$expectedSha256 = $hashMatch.Groups[1].Value.ToLowerInvariant()
 $actualSha256 = (Get-FileHash -Algorithm SHA256 $sourceElf).Hash.ToLowerInvariant()
 if (!$AllowUnverifiedElf -and $actualSha256 -ne $expectedSha256) {
     throw "Executable SHA-256 does not match the VCS profile. Expected $expectedSha256, got $actualSha256. Use -AllowUnverifiedElf only for development."
