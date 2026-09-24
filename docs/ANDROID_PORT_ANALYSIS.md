@@ -1,84 +1,85 @@
-# Android ARM64 portability analysis (VCS profile)
+# Android ARM64 port status (VCS profile)
 
-This is a dependency map for a later port, not an Android implementation. The
-current supported product is `VCSNative.exe` on Windows. The build currently
-selects `host/ge_gpu_backend_dx12.cpp`; renderer ownership and the game profile
-remain tied to the PSP VCS corpus and HLE contracts.
+## Current state
+
+- Android NDK `28.2.13676358`, CMake `3.22.1`, and Android API platforms
+  34–36 are installed on the development PC.
+- A Samsung Galaxy S25 Ultra (`SM-S938B`, Android 16 / API 36, `arm64-v8a`)
+  is attached and visible to ADB.
+- The portable framework target `psprecomp_core` cross-compiles successfully
+  for `arm64-v8a` as `out/android-arm64-core/libpsprecomp_core.a`.
+- A debug app shell builds, installs and runs on the S25 Ultra. Its Java
+  Activity calls JNI, links `psprecomp_core`, constructs PSP guest RAM and
+  displays bring-up status. This validates the NDK, Gradle, APK and device
+  path; it does not run the VCS game yet.
+- The VCS profile does not yet configure for Android. Its first configure-time
+  blocker is Android FFmpeg: CMake cannot find the required `avcodec` library.
+- The VCS host still selects `ge_gpu_backend_dx12.cpp` and `dx12_presenter.cpp`;
+  its current window/input implementation is Win32-specific. No Vulkan backend
+  source is present in `profiles/vcs/host`.
+- The decrypted, profile-verified VCS ELF and complete local game-data tree are
+  available in the ignored local game directory. Android still needs an
+  app-private game-data import/path flow; game data stays out of Git and the APK.
 
 ## Portability map
 
 | Classification | Current components | Android work |
 | --- | --- | --- |
-| `PORTABLE` | `include/psprecomp`, most of `src/` (Allegrex decode, guest memory, ELF parsing, scheduler/runtime), generated AOT C++, config parsing, media decode interfaces | Keep the framework C++20 and remove platform assumptions from shared APIs. Cross-build core and generated units with Android NDK/Clang. |
-| `WINDOWS_SPECIFIC` | `host/display_window.cpp` Win32 window/message loop and keyboard/raw mouse; dynamic XInput loading in `host/vcs_camera_input.cpp` / `host/vcs_vehicle_input.cpp`; Windows path/bootstrap branches; MSVC-specific build flags | Add Android Activity/JNI lifecycle, touch/gamepad input and app-private storage adapters. Keep a headless/test host for the portable runtime. |
-| `DX12_SPECIFIC` | `host/ge_gpu_backend_dx12.cpp`, `host/dx12_presenter.cpp`, `host/vcs_hdr_post_dx12_stub.cpp`, D3D12 resource/pipeline/swapchain code and DX12 probes | Implement a Vulkan backend behind `ge_gpu_backend.hpp`; replace DXGI presentation, shader/pipeline setup, resource state tracking and readback. Reuse the existing software renderer as the correctness reference during bring-up. |
-| `ARCH_SPECIFIC` | MSVC `/arch:AVX2`, AVX fallback unit list, x86/x64 intrinsics and host register/fast-memory optimizations in `src/runtime.cpp` and generated code | Audit every intrinsic and target-specific optimization. Compile ARM64 baseline first; add NEON only behind runtime/compile-time dispatch. AVX/AVX2 code cannot run on ARM64. |
-| `PSP_SPECIFIC` | Allegrex ISA/context, PSP syscalls/NIDs, PSP memory map and EDRAM, GE command/state emulation, PSP media formats and VCS address-specific AOT/HLE/patches | Preserve these semantics. Android replaces host services; it does not change guest CPU, syscall, memory, or title-profile behavior. |
+| Portable and cross-built | `include/psprecomp`, core `src/` runtime, ELF parser, guest memory, scheduler and decoder | Keep shared. The first ARM64 build succeeds with NDK Clang. |
+| Portable but not device-integrated | Generated VCS AOT C++, profile HLE and address-specific logic, config parsing | Cross-build for ARM64; replace executable-relative paths with Android app storage and lifecycle-aware services. |
+| Windows-specific host | `display_window.cpp`, keyboard/raw mouse path, XInput loading, Windows crash reporting and bootstrap branches | Add Android lifecycle integration, touch/controller input, Android logging, focus/resume handling, and app-private storage. |
+| Windows graphics | `ge_gpu_backend_dx12.cpp`, `dx12_presenter.cpp`, D3D12/DXGI pipelines, swapchain and resources | Implement Vulkan behind the renderer API, then select it for Android. Use the software raster path as a parity reference during bring-up. |
+| Media dependencies | `vcs_media_decoder.cpp` currently links the profile's Windows FFmpeg 7 libraries/DLLs | Build or integrate ARM64 Android FFmpeg libraries, or replace the Android media path with NDK MediaCodec/AAudio where formats permit. |
+| Architecture-specific | MSVC `/arch:AVX2`, x86 intrinsics and x64 host-register optimizations | Keep scalar ARM64 first; audit target-specific code before adding NEON. |
+| PSP-specific (keep shared) | Allegrex guest CPU, PSP syscalls/NIDs, guest memory/EDRAM, GE commands, PSP media formats and VCS HLE | Preserve these semantics; Android changes the host services, not the guest. |
 
-## Host boundaries found
+## Build evidence
 
-- **Window/input:** Win32 is compiled only under `_WIN32`; `std::thread`, mutexes,
-  atomics and condition variables are portable C++ facilities, but thread
-  ownership and shutdown are currently driven by a native HWND/message pump.
-  Keyboard and raw mouse handling are Win32-specific. XInput is dynamically
-  loaded and needs a game-controller API adapter on Android.
-- **Renderer:** the selected profile source is explicitly DX12. No Vulkan
-  backend implementation is selected or present in `profiles/vcs/host`; Vulkan
-  comments in `ge_gpu_backend.hpp` describe a future/experimental seam, not a
-  ready Android renderer. `ge_gpu_backend.hpp`
-  is a useful API seam, but its report and draw/resource structures include
-  backend-specific concepts. The host also contains a CPU/software rasterizer
-  suitable as a parity oracle. Shader sources and presentation need a Vulkan
-  implementation; DXGI/D3D12 headers and libraries do not carry over.
-- **Audio/media:** `audio_output.cpp` and `display_window.cpp` need inspection
-  for native output ownership. VCS bundles FFmpeg 7 headers and Windows import
-  libraries/DLLs; Android must link NDK-compatible FFmpeg builds or an Android
-  media path. WASAPI is not identified as an existing backend; the Windows host
-  links `winmm` instead. No evidence of an existing WASAPI implementation was
-  found in the VCS host.
-- **Filesystem/timers/memory:** profile bootstrap/configuration uses
-  `std::filesystem`; Windows paths and executable discovery have explicit
-  platform branches. Guest RAM and VRAM currently use `std::vector` storage;
-  no `VirtualAlloc` or `mmap` use was found in the inspected core/profile code.
-  Runtime scheduling uses `std::chrono` and standard C++ thread operations.
-  These are portable APIs, though Android lifecycle/background restrictions
-  still need an app-level policy.
-- **SIMD/compiler:** CMake applies AVX/AVX2 to MSVC targets and has per-unit AVX
-  exceptions for a compiler optimizer defect. Generated AOT files are regular
-  C++ but can inherit these flags and host-register fast paths. Build a scalar
-  ARM64 baseline and audit compiler intrinsics before enabling NEON.
+The framework cross-build used the installed Android SDK CMake and NDK with
+`ANDROID_ABI=arm64-v8a`, `ANDROID_PLATFORM=android-24`, tests disabled, and no
+AVX flags. It produced `libpsprecomp_core.a`. Clang reported an existing
+signedness warning in `include/psprecomp/common.hpp:18`; it did not prevent
+the build.
 
-## Reusable reVC-miami reference
+The debug APK was built, installed and launched on the attached S25 Ultra. The
+Android process remained alive after startup. The app currently only confirms
+that JNI and the C++ framework link and execute; it is a bring-up shell, not a
+gameplay build.
 
-The sibling `reVC-miami` checkout demonstrates a separate GTA Vice City source
-port with Android ABIs and a renderer abstraction using OpenGL ES. It can be a
-reference for Android packaging, lifecycle and graphics-backend organization.
-It is a different game and engine, with different game assets and executable
-model; none of its GTA VC gameplay code or assets are reusable as a VCS runtime.
+Configuring the full VCS profile with the same toolchain currently stops at
+`find_library(avcodec)`. The profile vendors Windows FFmpeg `.lib`/`.dll`
+artifacts, not Android `.so` libraries.
 
-## Suggested sequence
+## Build and install helpers
 
-1. Stabilize the Windows boot path and establish reproducible logs.
-2. Build the framework and AOT profile with Android NDK for `arm64-v8a`, first
-   without SIMD flags or GPU acceleration.
-3. Put host services behind narrow interfaces: filesystem/root, clock, audio,
-   input, window/surface and renderer.
-4. Keep HLE, guest memory, Allegrex and AOT output shared; add Vulkan separately
-   behind a cleaned backend interface and compare frames to software output.
-5. Validate the boot logo, menu, gameplay, suspend/resume and device loss on
-   actual ARM64 hardware before optimizing with NEON.
+From the repository root:
 
-## Current blockers and unknowns
+```powershell
+./build_android.ps1
+./run_android.ps1
+```
 
-The decrypted ELF required by this corpus is not present in the supplied UMD.
-The checked-in preparation script previously carried a different hard-coded
-SHA-256 than the profile TOML; it now reads the profile hash as the source of
-truth. The encrypted `EBOOT.BIN` and non-ELF `BOOT.BIN` in this UMD do not
-provide a decrypted input whose hash can be checked. Windows VCS compilation
-used CMake bundled with Visual Studio 18 and the installed VS 2022 toolset.
-The current runtime validator also demands `RUNDATA/PSP/MOVIES/LOGO.PMF` and
-`TITLES.PMF`; those paths are absent from the directly extracted UMD tree. The
-error message names `tools/Gerar_pacote_minimo_VCS_v0_7.bat`, which is absent
-from this checkout, so the required profile-specific game-data packaging step
-is not reproducible from the checked-in scripts yet. No Android port work has
-been started.
+The first builds `android/app/build/outputs/apk/debug/app-debug.apk`; the
+second installs and opens it on one connected ADB device. Both select Android
+Studio's JBR and the default SDK directory when environment variables are
+unset.
+
+## reVC-miami reference
+
+The sibling `reVC-miami` checkout has a working Android organization based on
+SDL2's `SDLActivity`, Java Activity classes, CMake, JNI, and packaged
+`arm64-v8a` libraries. Its Android shell and packaging conventions can guide
+this port. Its GTA Vice City gameplay engine, game assets, and title-specific
+code are not interchangeable with VCS.
+
+## Next milestones
+
+1. Replace the text-only bring-up activity with the actual lifecycle, storage,
+   logging, input, audio, and surface services needed by the VCS host.
+2. Make the profile CMake target platform-selectable rather than always
+   choosing DX12; cross-build the profile/HLE/AOT units for Android.
+3. Supply Android-compatible media dependencies and an ARM64 Vulkan GE backend.
+4. Import the user's game data into app-private storage without bundling it in
+   the APK.
+5. Validate boot, menu, gameplay, suspend/resume, touch/controller input, audio,
+   and Vulkan device loss on the S25 Ultra before optimization.

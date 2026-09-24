@@ -9064,7 +9064,13 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             // game list shows the modification time, so leaving these zero put
             // every save in the year zero.
             const auto written = std::filesystem::last_write_time(native, error);
-            const auto system_time = std::chrono::clock_cast<std::chrono::system_clock>(written);
+            // clock_cast is not implemented by every C++20 standard library
+            // shipped with Android NDKs. Convert using the offset between the
+            // two clocks; this works on libc++ and keeps save times usable.
+            const auto system_now = std::chrono::system_clock::now();
+            const auto file_now = std::filesystem::file_time_type::clock::now();
+            const auto system_time = system_now + std::chrono::duration_cast<
+                std::chrono::system_clock::duration>(written - file_now);
             const std::time_t seconds = std::chrono::system_clock::to_time_t(system_time);
             std::tm parts{};
 #if defined(_WIN32)

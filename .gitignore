@@ -1,6 +1,12 @@
 # Build output
 /out/
 /build/
+/logs/
+/android/.gradle/
+/android/app/build/
+/android/app/.cxx/
+/android/local.properties
+/android/app/*.apk
 CMakeUserPresets.json
 
 # Build directories created outside /out/ (per-stage trees use names like b457_perf)
@@ -50,3 +56,5 @@ SAVEDATA/
 # Python
 __pycache__/
 *.pyc
+
+/android/build/

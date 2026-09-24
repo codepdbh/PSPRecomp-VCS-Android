@@ -140,6 +140,26 @@ set(VCS_HOST_SOURCES
     host/dx12_presenter.cpp
 )
 
+# Android first builds the profile-specific guest runtime separately from its
+# host services. This keeps the portable VCS HLE/AOT corpus cross-buildable
+# while the Android window, media and renderer adapters are brought up. The
+# normal desktop target below remains unchanged.
+if(ANDROID)
+    add_library(vcs_guest_core STATIC
+        host/vcs_profile.cpp
+        host/vcs_native_fast_paths.cpp
+        ${VCS_GENERATED}
+    )
+    target_include_directories(vcs_guest_core PRIVATE
+        "${VCS_PROFILE_DIR}/host"
+        "${VCS_PROFILE_DIR}/generated"
+        "${VCS_PROFILE_DIR}/third_party/ffmpeg/include"
+    )
+    target_link_libraries(vcs_guest_core PRIVATE psprecomp_core ${CMAKE_DL_LIBS})
+    set_target_properties(vcs_guest_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    return()
+endif()
+
 function(vcs_target_common target)
     target_include_directories(${target} PRIVATE
         "${VCS_PROFILE_DIR}/host"
