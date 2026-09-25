@@ -44,6 +44,7 @@
 #include <stdexcept>
 #include <tuple>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -196,6 +197,13 @@ struct FileTable {
     std::unordered_map<std::string, VirtualDiscFile> virtual_files_by_path;
     std::map<std::uint32_t, std::string> virtual_path_by_sector;
     std::unordered_map<std::string, VirtualDiscStream> virtual_disc_streams;
+    // Where each entry of `files` came from, so a save state can reopen it.
+    // Entries outlive their fd; only fds still in `files` are ever read.
+    struct Origin {
+        std::filesystem::path path;
+        std::ios::openmode mode{};
+    };
+    std::unordered_map<std::int32_t, Origin> file_origins;
 };
 
 struct ParsedPsmfHeader {
@@ -2969,6 +2977,45 @@ void promote_expired_delays() {
     }
 }
 
+#if defined(__ANDROID__)
+// Lists every thread that is not runnable and what it is waiting for. Called
+// when nothing but the periodic system thread has been runnable for a while:
+// the "black screen, game still ticking" hangs are all a wait nobody signals,
+// and the only question that matters is which one.
+void dump_blocked_threads(const char *why) {
+    __android_log_print(ANDROID_LOG_WARN, "VCSBoot", "=== blocked threads (%s) virtual_us=%llu",
+                        why, static_cast<unsigned long long>(virtual_time_us));
+    for (const auto &[uid, thread] : thread_table.threads) {
+        if (thread.state == ThreadState::Completed || thread.state == ThreadState::Ready ||
+            thread.state == ThreadState::Running) continue;
+        std::string waits;
+        for (const auto &[suid, sema] : semaphore_table.semaphores)
+            for (const SemaphoreWaiter &w : sema.waiters)
+                if (w.uid == uid)
+                    waits += " sema " + std::to_string(suid) + ":" + sema.name + " count=" +
+                             std::to_string(sema.count) + " want=" + std::to_string(w.requested);
+        for (const auto &[fuid, flag] : event_flag_table.flags)
+            for (const EventFlagWaiter &w : flag.waiters)
+                if (w.uid == uid) {
+                    char buffer[96];
+                    std::snprintf(buffer, sizeof(buffer), " flag %d:%s pattern=%08x want=%08x mode=%x",
+                                  fuid, flag.name.c_str(), flag.current_pattern, w.requested, w.mode);
+                    waits += buffer;
+                }
+        for (const auto &[target, waiters] : thread_table.thread_end_waiters)
+            for (const ThreadContinuation &w : waiters)
+                if (w.uid == uid) waits += " thread-end " + std::to_string(target);
+        __android_log_print(ANDROID_LOG_WARN, "VCSBoot",
+            "  uid=%d %s state=%u pri=%u pc=%08x ra=%08x a0=%08x a1=%08x wakeups=%u delay_until=%llu%s",
+            uid, thread.name.c_str(), static_cast<unsigned>(thread.state), thread.priority,
+            thread.suspended_context.pc, thread.suspended_context.gpr[31],
+            thread.suspended_context.gpr[4], thread.suspended_context.gpr[5], thread.wakeup_count,
+            static_cast<unsigned long long>(thread.delay_until_us),
+            waits.empty() ? " (no sema/flag/thread-end wait)" : waits.c_str());
+    }
+}
+#endif
+
 bool activate_next_thread(psprecomp::AllegrexContext &ctx, const char *reason) {
     const std::int32_t previous_uid = thread_table.current_uid;
     promote_expired_delays();
@@ -5351,6 +5398,482 @@ void consume_event_flag(EventFlagRecord &flag, std::uint32_t requested, std::uin
     if ((mode & 0x10u) != 0u) flag.current_pattern = 0u;
 }
 
+// ---------------------------------------------------------------------------
+// Save states: the whole emulated machine at a vblank, separate from the
+// game's own memory-card saves.
+//
+// The snapshot is taken at the end of sceDisplayWaitVblank, once the waiting
+// thread has been parked and the next one picked. At that point every guest
+// thread but the running one is a plain AllegrexContext in the kernel tables,
+// the GE is idle, and the running thread is itself just `ctx`. Loading is a
+// thread switch like any other: tables and memory are replaced, ctx becomes
+// the saved thread, and the runtime unwinds to its dispatcher.
+//
+// Host objects are not stored but rebuilt: open files are reopened at their
+// offset, and ATRAC/movie decoders reopen lazily from sample_position the next
+// time the game asks for PCM.
+namespace {
+constexpr char kSaveStateMagic[8] = {'V', 'C', 'S', 'S', 'T', 'A', 'T', 'E'};
+constexpr std::uint32_t kSaveStateVersion = 1u;
+
+void state_log(bool warning, const std::string &line) {
+#if defined(__ANDROID__)
+    __android_log_print(warning ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "VCSState", "%s", line.c_str());
+#else
+    (void)warning;
+    std::cerr << "[savestate] " << line << "
+";
+#endif
+}
+
+struct StateArchive {
+    bool saving{};
+    std::vector<std::uint8_t> data;
+    std::size_t cursor{};
+
+    void bytes(void *pointer, std::size_t size) {
+        if (saving) {
+            const auto *begin = static_cast<const std::uint8_t *>(pointer);
+            data.insert(data.end(), begin, begin + size);
+            return;
+        }
+        if (size > data.size() - cursor) throw psprecomp::Error("estado incompleto o dañado");
+        std::memcpy(pointer, data.data() + cursor, size);
+        cursor += size;
+    }
+    std::uint64_t count(std::size_t value) {
+        std::uint64_t result = value;
+        bytes(&result, sizeof(result));
+        if (!saving && result > data.size()) throw psprecomp::Error("estado dañado");
+        return result;
+    }
+};
+
+template <class T>
+    requires std::is_trivially_copyable_v<T>
+void io(StateArchive &ar, T &value) { ar.bytes(&value, sizeof(T)); }
+void io(StateArchive &ar, std::string &value);
+void io(StateArchive &ar, std::filesystem::path &value);
+void io(StateArchive &ar, std::vector<bool> &value);
+template <class T> void io(StateArchive &ar, std::vector<T> &value);
+template <class T, std::size_t N>
+    requires(!std::is_trivially_copyable_v<std::array<T, N>>)
+void io(StateArchive &ar, std::array<T, N> &value);
+template <class K, class V, class H, class E, class A>
+void io(StateArchive &ar, std::unordered_map<K, V, H, E, A> &value);
+template <class K, class V, class C, class A>
+void io(StateArchive &ar, std::map<K, V, C, A> &value);
+template <class K, class H, class E, class A>
+void io(StateArchive &ar, std::unordered_set<K, H, E, A> &value);
+void io(StateArchive &ar, VirtualDiscFile &value);
+void io(StateArchive &ar, ThreadRecord &value);
+void io(StateArchive &ar, ThreadTable &value);
+void io(StateArchive &ar, PartitionBlock &value);
+void io(StateArchive &ar, PartitionTable &value);
+void io(StateArchive &ar, CallbackRecord &value);
+void io(StateArchive &ar, CallbackTable &value);
+void io(StateArchive &ar, SemaphoreRecord &value);
+void io(StateArchive &ar, SemaphoreTable &value);
+void io(StateArchive &ar, EventFlagRecord &value);
+void io(StateArchive &ar, EventFlagTable &value);
+void io(StateArchive &ar, FixedPoolRecord &value);
+void io(StateArchive &ar, FixedPoolTable &value);
+void io(StateArchive &ar, MpegContextState &value);
+void io(StateArchive &ar, AtracContextState &value);
+void io(StateArchive &ar, GeCallbackTable &value);
+void io(StateArchive &ar, GeListRecord &value);
+void io(StateArchive &ar, GeListTable &value);
+void io(StateArchive &ar, SasReverbState &value);
+void io(StateArchive &ar, SasState &value);
+
+template <class... T> void io_all(StateArchive &ar, T &...values) { (io(ar, values), ...); }
+
+void io(StateArchive &ar, std::string &value) {
+    const std::uint64_t size = ar.count(value.size());
+    if (!ar.saving) value.resize(static_cast<std::size_t>(size));
+    if (size != 0u) ar.bytes(value.data(), static_cast<std::size_t>(size));
+}
+void io(StateArchive &ar, std::filesystem::path &value) {
+    std::string text = value.string();
+    io(ar, text);
+    if (!ar.saving) value = std::filesystem::path(text);
+}
+void io(StateArchive &ar, std::vector<bool> &value) {
+    const std::uint64_t size = ar.count(value.size());
+    if (!ar.saving) value.assign(static_cast<std::size_t>(size), false);
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        bool bit = value[index];
+        io(ar, bit);
+        value[index] = bit;
+    }
+}
+template <class T> void io(StateArchive &ar, std::vector<T> &value) {
+    const std::uint64_t size = ar.count(value.size());
+    if (!ar.saving) value.assign(static_cast<std::size_t>(size), T{});
+    for (T &item : value) io(ar, item);
+}
+template <class T, std::size_t N>
+    requires(!std::is_trivially_copyable_v<std::array<T, N>>)
+void io(StateArchive &ar, std::array<T, N> &value) {
+    for (T &item : value) io(ar, item);
+}
+template <class Map> void io_map(StateArchive &ar, Map &value) {
+    std::uint64_t size = ar.count(value.size());
+    if (ar.saving) {
+        for (auto &[key, item] : value) {
+            auto key_copy = key;
+            io(ar, key_copy);
+            io(ar, item);
+        }
+        return;
+    }
+    value.clear();
+    while (size-- != 0u) {
+        typename Map::key_type key{};
+        typename Map::mapped_type item{};
+        io(ar, key);
+        io(ar, item);
+        value.emplace(std::move(key), std::move(item));
+    }
+}
+template <class K, class V, class H, class E, class A>
+void io(StateArchive &ar, std::unordered_map<K, V, H, E, A> &value) { io_map(ar, value); }
+template <class K, class V, class C, class A>
+void io(StateArchive &ar, std::map<K, V, C, A> &value) { io_map(ar, value); }
+template <class K, class H, class E, class A>
+void io(StateArchive &ar, std::unordered_set<K, H, E, A> &value) {
+    std::uint64_t size = ar.count(value.size());
+    if (ar.saving) {
+        for (K key : value) io(ar, key);
+        return;
+    }
+    value.clear();
+    while (size-- != 0u) {
+        K key{};
+        io(ar, key);
+        value.insert(std::move(key));
+    }
+}
+
+void io(StateArchive &ar, VirtualDiscFile &value) {
+    io_all(ar, value.native_path, value.start_sector, value.size);
+}
+void io(StateArchive &ar, ThreadRecord &value) {
+    io_all(ar, value.name, value.entry, value.priority, value.stack_size, value.attributes,
+           value.stack_top, value.stack_bottom, value.kernel_context, value.state,
+           value.exit_status, value.externally_suspended, value.suspended_context,
+           value.wakeup_count, value.delay_until_us, value.delay_sequence);
+}
+void io(StateArchive &ar, ThreadTable &value) {
+    io_all(ar, value.next_uid, value.current_uid, value.next_stack_top,
+           value.next_ready_sequence, value.next_delay_sequence, value.threads,
+           value.continuations, value.thread_end_waiters, value.free_stacks);
+}
+void io(StateArchive &ar, PartitionBlock &value) {
+    io_all(ar, value.name, value.address, value.size);
+}
+void io(StateArchive &ar, PartitionTable &value) {
+    io_all(ar, value.next_uid, value.next_address, value.blocks);
+}
+void io(StateArchive &ar, CallbackRecord &value) {
+    io_all(ar, value.name, value.function, value.common, value.owner_uid,
+           value.notify_count, value.notify_argument);
+}
+void io(StateArchive &ar, CallbackTable &value) { io_all(ar, value.next_uid, value.callbacks); }
+void io(StateArchive &ar, SemaphoreRecord &value) {
+    io_all(ar, value.name, value.count, value.maximum, value.waiters);
+}
+void io(StateArchive &ar, SemaphoreTable &value) { io_all(ar, value.next_uid, value.semaphores); }
+void io(StateArchive &ar, EventFlagRecord &value) {
+    io_all(ar, value.name, value.attributes, value.initial_pattern, value.current_pattern,
+           value.waiters);
+}
+void io(StateArchive &ar, EventFlagTable &value) { io_all(ar, value.next_uid, value.flags); }
+void io(StateArchive &ar, FixedPoolRecord &value) {
+    io_all(ar, value.name, value.address, value.block_size, value.block_count, value.allocated);
+}
+void io(StateArchive &ar, FixedPoolTable &value) { io_all(ar, value.next_uid, value.pools); }
+void io(StateArchive &ar, MpegContextState &value) {
+    // The decoders are not stored. audio_source stays empty after a load so the
+    // soundtrack reopens; the video decoder reopens by itself.
+    io_all(ar, value.handle_address, value.ring_address, value.header, value.streams,
+           value.avc_es_buffers, value.video_pixel_mode, value.video_au_count,
+           value.audio_au_count, value.decoded_video_frames, value.consumed_video_packets,
+           value.source_path, value.video_eof, value.analyzed);
+}
+void io(StateArchive &ar, AtracContextState &value) {
+    // decoder is not stored: read_atrac_pcm reopens it at sample_position.
+    io_all(ar, value.allocated, value.header, value.buffer_address, value.initial_read_size,
+           value.buffer_size, value.buffered_encoded_bytes, value.next_file_offset,
+           value.write_offset, value.last_writable_bytes, value.sample_position,
+           value.loop_num, value.internal_error, value.source_path, value.decoder_eof);
+    if (!ar.saving) value.decoder_eof = false;
+}
+void io(StateArchive &ar, GeCallbackTable &value) { io_all(ar, value.next_uid, value.callbacks); }
+void io(StateArchive &ar, GeListRecord &value) {
+    io_all(ar, value.guest_id, value.start_pc, value.pc, value.stall, value.callback_id,
+           value.context_address, value.stack_address, value.stack_capacity, value.state,
+           value.signal_behavior, value.callback_token, value.stack, value.histogram,
+           value.executed_commands, value.primitive_commands, value.has_saved_context,
+           value.saved_commands, value.saved_transform, value.saved_offset_address,
+           value.saved_vertex_address, value.saved_index_address,
+           value.saved_bounding_box_result);
+}
+void io(StateArchive &ar, GeListTable &value) {
+    io_all(ar, value.next_raw_id, value.lists, value.queue);
+}
+void io(StateArchive &ar, SasReverbState &value) {
+    io_all(ar, value.type, value.delay, value.feedback, value.left_volume, value.right_volume,
+           value.dry, value.wet, value.history_left, value.history_right, value.history_cursor);
+}
+void io(StateArchive &ar, SasState &value) {
+    io_all(ar, value.initialized, value.core_address, value.grain_size, value.max_voices,
+           value.output_mode, value.sample_rate, value.voices, value.reverb);
+}
+
+// Host file handles: path, mode and offset out; a fresh stream back in.
+void io_open_files(StateArchive &ar) {
+    struct OpenFile {
+        std::int32_t fd{};
+        std::filesystem::path path;
+        std::uint32_t mode{};
+        std::int64_t position{};
+    };
+    std::vector<OpenFile> open;
+    if (ar.saving) {
+        for (auto &[fd, stream] : file_table.files) {
+            const auto origin = file_table.file_origins.find(fd);
+            if (origin == file_table.file_origins.end()) continue;
+            stream.clear();
+            std::streamoff position = stream.tellg();
+            if (position < 0) position = stream.tellp();
+            open.push_back({fd, origin->second.path,
+                            static_cast<std::uint32_t>(origin->second.mode),
+                            static_cast<std::int64_t>(std::max<std::streamoff>(0, position))});
+        }
+    }
+    std::uint64_t size = ar.count(open.size());
+    if (!ar.saving) open.resize(static_cast<std::size_t>(size));
+    for (OpenFile &file : open) io_all(ar, file.fd, file.path, file.mode, file.position);
+    if (ar.saving) return;
+
+    file_table.files.clear();
+    file_table.directories.clear();
+    file_table.virtual_disc_streams.clear();
+    for (const OpenFile &file : open) {
+        const auto mode = static_cast<std::ios::openmode>(file.mode);
+        // A write-only reopen would truncate what the game wrote before the
+        // snapshot; opening for update keeps it.
+        const auto reopen_mode = (mode & std::ios::out) != 0 ? (mode | std::ios::in) : mode;
+        std::fstream stream(file.path, reopen_mode);
+        if (!stream) {
+            state_log(true, "no se pudo reabrir " + file.path.string());
+            continue;
+        }
+        stream.seekg(file.position);
+        stream.seekp(file.position);
+        file_table.files.emplace(file.fd, std::move(stream));
+        file_table.file_origins[file.fd] = {file.path, mode};
+    }
+}
+
+void io_machine(StateArchive &ar, psprecomp::AllegrexContext &ctx) {
+    io_all(ar, ctx, deflate_fast_pending, deferred_io_resumes);
+    io_all(ar, file_table.next_fd, file_table.next_virtual_sector,
+           file_table.synthetic_empty_files, file_table.virtual_disc_handles,
+           file_table.virtual_files_by_path, file_table.virtual_path_by_sector);
+    io_open_files(ar);
+    io_all(ar, movie_output_buffers, thread_table, partition_table, callback_table,
+           semaphore_table, event_flag_table, timed_kernel_waits, fixed_pool_table,
+           compiled_sdk_version, compiler_version, next_module_uid, loaded_modules,
+           mpeg_contexts, atrac_contexts, next_mpeg_stream_id, audio_channels,
+           virtual_time_us, volatile_memory_locked, general_purpose_io, ge_edram_translation,
+           ge_callback_table, ge_state, ge_list_table, pending_guest_callbacks,
+           async_return_frames, display_state, sub_interrupts, memory_stick_fat_state,
+           controller_state, sas_state, savedata_utility);
+}
+
+std::span<std::uint8_t> guest_region(psprecomp::GuestMemory &memory, std::uint32_t base,
+                                     std::uint32_t size) {
+    std::uint8_t *pointer = memory.raw_pointer(base, size);
+    if (pointer == nullptr) throw psprecomp::Error("memoria del juego no accesible");
+    return {pointer, size};
+}
+
+void write_all(std::ofstream &out, const void *data, std::size_t size) {
+    out.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
+}
+void read_all(std::ifstream &in, void *data, std::size_t size) {
+    in.read(static_cast<char *>(data), static_cast<std::streamsize>(size));
+    if (static_cast<std::size_t>(in.gcount()) != size)
+        throw psprecomp::Error("archivo de estado incompleto");
+}
+
+void save_machine_state(psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx,
+                        const std::filesystem::path &file) {
+    StateArchive ar;
+    ar.saving = true;
+    io_machine(ar, ctx);
+    const std::uint32_t ram_size = rt.memory().size();
+    const std::uint32_t vram_size = psprecomp::GuestMemory::kVramSize;
+    const auto ram = guest_region(rt.memory(), psprecomp::GuestMemory::kPhysicalBase, ram_size);
+    const auto vram = guest_region(rt.memory(), psprecomp::GuestMemory::kVramPhysicalBase, vram_size);
+
+    std::filesystem::create_directories(file.parent_path());
+    std::filesystem::path temporary = file;
+    temporary += ".tmp";
+    {
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        if (!out) throw psprecomp::Error("no se pudo crear el archivo");
+        const std::uint64_t tables = ar.data.size();
+        write_all(out, kSaveStateMagic, sizeof(kSaveStateMagic));
+        write_all(out, &kSaveStateVersion, sizeof(kSaveStateVersion));
+        write_all(out, &ram_size, sizeof(ram_size));
+        write_all(out, &vram_size, sizeof(vram_size));
+        write_all(out, &tables, sizeof(tables));
+        write_all(out, ar.data.data(), ar.data.size());
+        write_all(out, ram.data(), ram.size());
+        write_all(out, vram.data(), vram.size());
+        out.flush();
+        if (!out) throw psprecomp::Error("no hay espacio para guardar");
+    }
+    std::filesystem::rename(temporary, file);
+}
+
+void load_machine_state(psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx,
+                        const std::filesystem::path &file) {
+    std::ifstream in(file, std::ios::binary);
+    if (!in) throw psprecomp::Error("no hay estado guardado en esta ranura");
+    char magic[8]{};
+    std::uint32_t version = 0u, ram_size = 0u, vram_size = 0u;
+    std::uint64_t tables = 0u;
+    read_all(in, magic, sizeof(magic));
+    read_all(in, &version, sizeof(version));
+    read_all(in, &ram_size, sizeof(ram_size));
+    read_all(in, &vram_size, sizeof(vram_size));
+    read_all(in, &tables, sizeof(tables));
+    if (std::memcmp(magic, kSaveStateMagic, sizeof(magic)) != 0 || version != kSaveStateVersion)
+        throw psprecomp::Error("el estado es de otra versión");
+    if (ram_size != rt.memory().size() || vram_size != psprecomp::GuestMemory::kVramSize ||
+        tables > 256ull * 1024ull * 1024ull)
+        throw psprecomp::Error("el estado no corresponde a este juego");
+
+    // Everything is read before the running machine is touched, so a short
+    // or damaged file leaves the game as it was.
+    StateArchive ar;
+    ar.data.resize(static_cast<std::size_t>(tables));
+    read_all(in, ar.data.data(), ar.data.size());
+    std::vector<std::uint8_t> ram(ram_size), vram(vram_size);
+    read_all(in, ram.data(), ram.size());
+    read_all(in, vram.data(), vram.size());
+
+    for (auto &[address, state] : mpeg_contexts) close_video_decoder(state);
+    mpeg_contexts.clear();
+    for (auto &state : atrac_contexts) close_atrac_decoder(state);
+    io_machine(ar, ctx);
+
+    const auto ram_target = guest_region(rt.memory(), psprecomp::GuestMemory::kPhysicalBase, ram_size);
+    const auto vram_target = guest_region(rt.memory(), psprecomp::GuestMemory::kVramPhysicalBase, vram_size);
+    std::memcpy(ram_target.data(), ram.data(), ram.size());
+    std::memcpy(vram_target.data(), vram.data(), vram.size());
+
+    ++ge_draw_state_revision;
+    ++ge_lighting_state_revision;
+    ++ge_camera_state_revision;
+    for (std::uint32_t channel = 0u; channel < audio_channels.size(); ++channel)
+        audio_output_reset_channel(channel);
+    refresh_vcs_post_dispatch_hook();
+    // Force a thread switch even when the saved thread has the running one's
+    // uid, so the translated code drops whatever registers it still caches.
+    std::string name;
+    if (const auto thread = thread_table.threads.find(thread_table.current_uid);
+        thread != thread_table.threads.end())
+        name = thread->second.name;
+    psprecomp::set_runtime_thread_identity(-2, "savestate");
+    psprecomp::set_runtime_thread_identity(thread_table.current_uid, name);
+}
+
+struct SaveStateMailbox {
+    std::mutex mutex;
+    std::condition_variable done;
+    std::atomic_bool pending{};
+    bool taken{};
+    bool save{};
+    std::filesystem::path file;
+    std::uint64_t serial{};
+    std::uint64_t finished_serial{};
+    bool ok{};
+    std::string message;
+};
+SaveStateMailbox save_state_mailbox;
+
+// Called by the vblank HLE after its thread switch: the one safe point.
+void service_save_state_request(psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+    if (!save_state_mailbox.pending.load(std::memory_order_acquire)) return;
+    bool save = false;
+    std::filesystem::path file;
+    std::uint64_t serial = 0u;
+    {
+        std::lock_guard lock(save_state_mailbox.mutex);
+        if (!save_state_mailbox.pending.load(std::memory_order_relaxed)) return;
+        save_state_mailbox.taken = true;
+        save = save_state_mailbox.save;
+        file = save_state_mailbox.file;
+        serial = save_state_mailbox.serial;
+    }
+    bool ok = false;
+    std::string message;
+    const auto start = std::chrono::steady_clock::now();
+    try {
+        if (save) save_machine_state(rt, ctx, file);
+        else load_machine_state(rt, ctx, file);
+        ok = true;
+        message = save ? "Estado guardado" : "Estado cargado";
+    } catch (const std::exception &error) {
+        message = std::string(save ? "No se pudo guardar: " : "No se pudo cargar: ") + error.what();
+    }
+    state_log(!ok, message + " " + file.string() + " (" + std::to_string(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count()) + " ms)");
+    {
+        std::lock_guard lock(save_state_mailbox.mutex);
+        save_state_mailbox.ok = ok;
+        save_state_mailbox.message = std::move(message);
+        save_state_mailbox.finished_serial = serial;
+        save_state_mailbox.taken = false;
+        save_state_mailbox.pending.store(false, std::memory_order_release);
+    }
+    save_state_mailbox.done.notify_all();
+}
+} // namespace
+
+bool save_state_request(bool save, const std::filesystem::path &file, std::string &message) {
+    std::unique_lock lock(save_state_mailbox.mutex);
+    if (save_state_mailbox.pending.load(std::memory_order_relaxed)) {
+        message = "Ya hay una operación de estado en curso";
+        return false;
+    }
+    const std::uint64_t serial = ++save_state_mailbox.serial;
+    save_state_mailbox.save = save;
+    save_state_mailbox.file = file;
+    save_state_mailbox.taken = false;
+    save_state_mailbox.pending.store(true, std::memory_order_release);
+    const auto finished = [&] { return save_state_mailbox.finished_serial == serial; };
+    // The game reaches a vblank many times a second; not reaching one in a few
+    // seconds means it is not running. Once the game thread has taken the
+    // request it is always waited for.
+    if (!save_state_mailbox.done.wait_for(lock, std::chrono::seconds(4), finished)) {
+        if (!save_state_mailbox.taken) {
+            save_state_mailbox.pending.store(false, std::memory_order_release);
+            message = "El juego no está en marcha";
+            return false;
+        }
+        save_state_mailbox.done.wait(lock, finished);
+    }
+    message = save_state_mailbox.message;
+    return save_state_mailbox.ok;
+}
+
 void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start) {
     install_native_fast_paths(runtime);
     if (configured_game_frame_rate() > 30u) {
@@ -6048,6 +6571,28 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 current != thread_table.threads.end() ? current->second.name.c_str() : "unknown",
                 ctx.gpr[4], static_cast<unsigned long long>(virtual_time_us), ctx.gpr[31],
                 thread_table.continuations.size(), thread_table.threads.size());
+            // Nothing else runnable for 10 s straight: dump who waits on what.
+            static unsigned idle_samples = 0u;
+            idle_samples = thread_table.continuations.empty() ? idle_samples + 1u : 0u;
+            // At 10 s, then every 30 s for as long as it lasts.
+            if (idle_samples >= 5u && (idle_samples - 5u) % 15u == 0u)
+                dump_blocked_threads("only the system thread runnable");
+            // Every 10 s: the imports called most in that window.
+            static unsigned histogram_ticks = 0u;
+            static std::unordered_map<std::string, std::uint64_t> previous_counts;
+            if (++histogram_ticks % 5u == 0u) {
+                std::vector<std::pair<std::uint64_t, std::string>> deltas;
+                for (const auto &[key, count] : rt.hle_histogram()) {
+                    const std::uint64_t before = previous_counts[key];
+                    if (count > before) deltas.emplace_back(count - before, key);
+                    previous_counts[key] = count;
+                }
+                std::sort(deltas.rbegin(), deltas.rend());
+                std::string line;
+                for (std::size_t i = 0; i < deltas.size() && i < 10u; ++i)
+                    line += " " + deltas[i].second + "=" + std::to_string(deltas[i].first);
+                __android_log_print(ANDROID_LOG_INFO, "VCSHle", "last 10s:%s", line.c_str());
+            }
             std::vector<std::int32_t> uids;
             uids.reserve(thread_table.threads.size());
             if (android_delay_calls <= 12u) {
@@ -7353,10 +7898,17 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         if (!activate_next_thread(ctx, "vblank-wait"))
             rt.stop("PSP scheduler deadlock while waiting for VBlank interrupt");
     };
-    runtime.register_hle("sceDisplay", 0x36CDFADEu, wait_vblank);
-    runtime.register_hle("sceDisplay", 0x8EB9EC49u, wait_vblank);
-    runtime.register_hle("sceDisplay", 0x984C27E7u, wait_vblank);
-    runtime.register_hle("sceDisplay", 0x46F186C3u, wait_vblank);
+    // Save states are taken and restored here, after the vblank's own thread
+    // switch, where every guest thread is parked in the kernel tables.
+    auto wait_vblank_with_save_states = [wait_vblank](psprecomp::Runtime &rt,
+                                                      psprecomp::AllegrexContext &ctx) {
+        wait_vblank(rt, ctx);
+        if (!rt.stopped()) service_save_state_request(rt, ctx);
+    };
+    runtime.register_hle("sceDisplay", 0x36CDFADEu, wait_vblank_with_save_states);
+    runtime.register_hle("sceDisplay", 0x8EB9EC49u, wait_vblank_with_save_states);
+    runtime.register_hle("sceDisplay", 0x984C27E7u, wait_vblank_with_save_states);
+    runtime.register_hle("sceDisplay", 0x46F186C3u, wait_vblank_with_save_states);
     runtime.register_hle("sceDisplay", 0xB4F378FAu,
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, 1u); });
 
@@ -9349,6 +9901,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                             if (stream) {
                                 const auto fd = file_table.next_fd++;
                                 file_table.files.emplace(fd, std::move(stream));
+                                file_table.file_origins[fd] = {disc_file->native_path,
+                                                               std::ios::binary | std::ios::in};
                                 if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr) {
                                     std::cerr << "[io] raw UMD open lbn=" << raw_lbn
                                               << " size=" << raw_size
@@ -9400,6 +9954,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             const auto fd = file_table.next_fd++;
             file_table.files.emplace(fd, std::move(stream));
+            file_table.file_origins[fd] = {native, mode};
             if (file_object_diag) {
                 std::cerr << "[fileobj-hle] open-ok fd=" << fd << " path=\"" << path
                           << "\" native=\"" << native.string()

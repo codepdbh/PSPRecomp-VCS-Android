@@ -2,6 +2,7 @@
 #include "psprecomp/runtime.hpp"
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 
 namespace vcs {
@@ -24,4 +25,9 @@ void report_disc_read_stats();
 // what decides whether PSPRECOMP_GE_GPU_SKIP_DISPLAYED_RASTER is safe.
 void report_present_stats();
 [[nodiscard]] bool run_profile_self_tests(std::string &error);
+
+// Saves (save=true) or restores the whole emulated machine to/from `file` at
+// the game's next vblank. Thread-safe; blocks until done, or a few seconds if
+// the game is not running. `message` is a user-facing result in Spanish.
+bool save_state_request(bool save, const std::filesystem::path &file, std::string &message);
 }

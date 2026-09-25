@@ -10,10 +10,10 @@
   <img alt="C++20" src="https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white" />
   <img alt="Android ARM64 Vulkan" src="https://img.shields.io/badge/Android-ARM64%20%C2%B7%20Vulkan-3DDC84?logo=android&logoColor=white" />
   <img alt="Windows DirectX 12" src="https://img.shields.io/badge/Windows-DirectX%2012-0078D4?logo=windows&logoColor=white" />
-  <img alt="Estado beta" src="https://img.shields.io/badge/estado-beta%200.1.0-orange" />
+  <img alt="Estado beta" src="https://img.shields.io/badge/estado-beta%200.2.0-orange" />
 </p>
 
-> **Estado actual (beta 0.1.0):** el juego se juega en Android con render por GPU (Vulkan), en HD o a la resolución nativa de la pantalla, en pantalla completa widescreen y con audio. Todavía hay caídas de rendimiento en resoluciones altas y detalles pendientes (ver [Problemas conocidos](#problemas-conocidos)).
+> **Estado actual (beta 0.2.0):** el juego se juega en Android con render por GPU (Vulkan), en pantalla completa widescreen, con audio completo (incluidas las voces de las cinemáticas) y con guardado de estado. Todavía hay detalles pendientes (ver [Problemas conocidos](#problemas-conocidos)).
 
 ## El proyecto
 
@@ -55,9 +55,19 @@ Si la app no encuentra `VCS/PSP_GAME/SYSDIR/EBOOT_DECRYPTED.ELF`, lo avisa en pa
 2. Al abrirla por primera vez, concede el permiso **"Acceso a todos los archivos"**; sin él no puede leer la carpeta `VCS`. Luego vuelve a abrir la app.
 3. La primera carga tarda un poco más.
 
+### Guardado de estado (botón 💾 junto a START)
+
+Guarda el juego completo en el instante exacto —misión, cinemática, posición— y lo recupera después. Es independiente de las partidas del propio juego.
+
+- Hay **3 ranuras**; cada una muestra la fecha y hora de lo guardado.
+- Toca una ranura para **Guardar aquí** / **Sobrescribir** o **Cargar**.
+- También está en ⚙ → **Guardado de estado…**.
+- Los estados se guardan dentro de la app (`files/savestates`) y se pierden al desinstalarla.
+
 ### Ajustes (botón ⚙ en pantalla)
 
-- **Resolución interna:** HD, Full HD o nativa de la pantalla. Se aplica al reiniciar la app.
+- **Guardado de estado:** las mismas ranuras que el botón 💾.
+- **Resolución interna:** Rendimiento (por debajo de HD, la más fluida), HD, Full HD o nativa de la pantalla. Se aplica al reiniciar la app.
 - **Editar posición de controles:** arrastra cada grupo de botones y ajusta su tamaño con − / +.
 - **Restablecer controles:** vuelve al diseño original.
 
@@ -71,9 +81,12 @@ La configuración avanzada vive en `VCSNative.ini`, dentro de los archivos priva
 
 Al usar un mando, un teclado o un ratón, los controles táctiles se ocultan; vuelven al tocar la pantalla.
 
+El radar está arriba a la izquierda, donde no lo tapa el pulgar. Si el botón L te lo tapa, muévelo con ⚙ → **Editar posición de controles**.
+
 ### Problemas conocidos
 
-- En resoluciones altas el juego no siempre llega a velocidad completa. Si va lento, baja a HD desde ⚙.
+- En resoluciones altas el juego no siempre llega a velocidad completa. Si va lento, baja a HD o a Rendimiento desde ⚙.
+- En algunos puntos (el icono de guardado del juego, el final de algunas misiones) la pantalla puede quedarse en negro. Se está investigando; mientras tanto, usa el guardado de estado antes de esos momentos para no perder avance.
 - Los videos de introducción se saltan (pantalla negra): falta el decodificador de video para Android.
 - El ratón todavía no mueve la cámara; sus botones sí funcionan.
 - El APK beta está firmado con una clave de depuración.

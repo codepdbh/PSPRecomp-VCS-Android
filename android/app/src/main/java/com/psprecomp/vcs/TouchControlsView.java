@@ -44,12 +44,14 @@ final class TouchControlsView extends View {
     interface Listener {
         void onInput(int buttons, int analogX, int analogY, boolean accelerate, boolean brake);
         void onSettingsRequested();
+        void onSaveStateRequested();
         void onEditModeChanged(boolean editing);
     }
 
     private static final int SHAPE_CIRCLE = 0, SHAPE_PILL = 1, SHAPE_SHOULDER = 2;
     private static final int GLYPH_TEXT = 0, GLYPH_CROSS = 1, GLYPH_CIRCLE = 2,
-            GLYPH_SQUARE = 3, GLYPH_TRIANGLE = 4, GLYPH_ARROW = 5, GLYPH_GEAR = 6;
+            GLYPH_SQUARE = 3, GLYPH_TRIANGLE = 4, GLYPH_ARROW = 5, GLYPH_GEAR = 6,
+            GLYPH_DISK = 7;
 
     // Groups move and scale as one unit in the editor.
     private static final int G_STICK = 0, G_DPAD = 1, G_FACE = 2, G_L = 3, G_R = 4,
@@ -120,6 +122,7 @@ final class TouchControlsView extends View {
     private final Control dpadDown = new Control(PSP_DOWN, SHAPE_CIRCLE, GLYPH_ARROW, null, COLOR_NEUTRAL, true, G_DPAD);
     private final Control dpadLeft = new Control(PSP_LEFT, SHAPE_CIRCLE, GLYPH_ARROW, null, COLOR_NEUTRAL, true, G_DPAD);
     private final Control settings = new Control(0, SHAPE_CIRCLE, GLYPH_GEAR, null, COLOR_NEUTRAL, false, -1);
+    private final Control saveState = new Control(0, SHAPE_CIRCLE, GLYPH_DISK, null, COLOR_NEUTRAL, false, -1);
     {
         dpadUp.arrowDirection = 0;
         dpadRight.arrowDirection = 1;
@@ -128,7 +131,7 @@ final class TouchControlsView extends View {
     }
     private final Control[] controls = {
         triangle, circle, cross, square, shoulderL, shoulderR, select, start,
-        dpadUp, dpadRight, dpadDown, dpadLeft, settings,
+        dpadUp, dpadRight, dpadDown, dpadLeft, settings, saveState,
     };
 
     // Analog stick.
@@ -287,6 +290,9 @@ final class TouchControlsView extends View {
         select.hitMargin = start.hitMargin = margin * 0.4f;
         placeCircle(settings, cx, pillY + pillH / 2f, gearR);
         settings.hitMargin = margin * 0.3f;
+        // Save states: their own button, just right of START.
+        placeCircle(saveState, cx + gap + pillW + margin * 0.8f + gearR, pillY + pillH / 2f, gearR);
+        saveState.hitMargin = margin * 0.3f;
 
         // The player's customisation, on top of the defaults.
         transformGroup(G_FACE, faceCx, faceCy, w, h);
@@ -489,6 +495,10 @@ final class TouchControlsView extends View {
                 listener.onSettingsRequested();
                 return;
             }
+            if (c == saveState) {
+                listener.onSaveStateRequested();
+                return;
+            }
             c.pointerId = id;
             c.pressed = true;
             return;
@@ -596,7 +606,7 @@ final class TouchControlsView extends View {
         }
         drawStick(canvas);
         for (Control c : controls) {
-            if (editMode && c == settings) continue;
+            if (editMode && (c == settings || c == saveState)) continue;
             drawControl(canvas, c);
         }
         if (editMode) drawEditor(canvas);
@@ -707,6 +717,9 @@ final class TouchControlsView extends View {
             case GLYPH_GEAR:
                 drawGear(canvas, cx, cy, size * 0.30f, glyphColor, ring);
                 break;
+            case GLYPH_DISK:
+                drawDisk(canvas, cx, cy, size * 0.25f, glyphColor, ring);
+                break;
             default:
                 text.setColor(glyphColor);
                 text.setTextSize(c.shape == SHAPE_SHOULDER ? r.height() * 0.52f : r.height() * 0.42f);
@@ -762,6 +775,25 @@ final class TouchControlsView extends View {
         canvas.rotate(direction * 90f);
         canvas.drawPath(path, fill);
         canvas.restore();
+    }
+
+    /** A floppy disk: the universal "save" sign. */
+    private void drawDisk(Canvas canvas, float cx, float cy, float h, int color, float ring) {
+        stroke.setColor(color);
+        stroke.setStrokeWidth(Math.max(3f, ring));
+        stroke.setStrokeJoin(Paint.Join.ROUND);
+        path.reset();
+        path.moveTo(cx - h, cy - h);
+        path.lineTo(cx + h * 0.6f, cy - h);
+        path.lineTo(cx + h, cy - h * 0.6f);
+        path.lineTo(cx + h, cy + h);
+        path.lineTo(cx - h, cy + h);
+        path.close();
+        canvas.drawPath(path, stroke);
+        // Shutter on top, label below.
+        canvas.drawRect(cx - h * 0.45f, cy - h, cx + h * 0.35f, cy - h * 0.45f, stroke);
+        canvas.drawRect(cx - h * 0.6f, cy + h * 0.15f, cx + h * 0.6f, cy + h, stroke);
+        stroke.setStrokeJoin(Paint.Join.MITER);
     }
 
     private void drawGear(Canvas canvas, float cx, float cy, float radius, int color, float ring) {

@@ -77,6 +77,10 @@ struct VulkanPreview {
     // A frame submitted but not yet collected. The CPU no longer waits for the
     // GPU right after submitting: it goes on emulating the next vblank while
     // the GPU draws, and collects the result at the start of the next frame.
+    // The last frame drew into the displayed surface through the world target
+    // (interface drawn into 0x88000, then composited). Menus that double-buffer
+    // draw straight into a surface instead, and must not be treated as world.
+    bool composited_last_frame{};
     bool frame_in_flight{};
     bool fence_waited{};
     std::uint64_t in_flight_vblank{};
@@ -1050,6 +1054,8 @@ GeGpuWidescreenHud ge_gpu_backend_widescreen_hud(const GeGpuDrawDescriptor &draw
     GeGpuWidescreenHud hud{};
     const auto &s = state();
     if (!s.enabled || !s.authoritative) return hud;
+    hud.gameplay_world = s.frame_has_scene && s.world_framebuffer_address != 0u &&
+        (draw.framebuffer_address & 0x001FFFF0u) == s.world_framebuffer_address;
     const VcsConfiguration &config = vcs_configuration();
     if (!config.initialized || !config.widescreen.enabled) return hud;
     const DisplaySurfaceDimensions panel = resolve_display_surface_dimensions(config.display);
@@ -1058,8 +1064,8 @@ GeGpuWidescreenHud ge_gpu_backend_widescreen_hud(const GeGpuDrawDescriptor &draw
     // The HUD is drawn into the 512-wide world surface, which the composition
     // maps onto the 480-wide display.
     const std::uint32_t target = draw.framebuffer_address & 0x001FFFF0u;
-    const bool world = s.frame_has_scene && s.world_framebuffer_address != 0u &&
-        target == s.world_framebuffer_address;
+    const bool world = (s.frame_has_scene || s.composited_last_frame) &&
+        s.world_framebuffer_address != 0u && target == s.world_framebuffer_address;
     const std::uint32_t logical_width = world ? kWorldWidth : kWidth;
     hud.shrink = shrink;
     hud.display_scale_x = static_cast<float>(kWidth) / static_cast<float>(logical_width);
@@ -1420,17 +1426,24 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
                                   batch.framebuffer_feedback});
             }
         };
-        if (has_scene_draws) {
-            // Gameplay: the world pass, then the composition into the display.
+        const bool display_has_draws = std::any_of(s.batches.begin(), s.batches.end(),
+            [&](const DrawBatch &batch) {
+                return (batch.draw.framebuffer_address & 0x001FFFF0u) == s.display_framebuffer;
+            });
+        if (has_scene_draws || display_has_draws) {
+            // Gameplay, and the 2D screens built the same way - save prompts,
+            // "continue game", mission titles: drawn into the world surface and
+            // composited into the display. Both passes, or the interface drawn
+            // into the world surface is lost and the screen stays black while
+            // the game waits for an answer to a prompt nobody can see.
             if (s.authoritative && s.world_framebuffer_address != 0u &&
                 s.world_framebuffer_address != s.display_framebuffer)
                 select_target(s.world_framebuffer_address, world_batches);
             select_target(s.display_framebuffer, display_batches);
         } else {
-            // 2D-only frame (menus, the composition-only vblank). Menus
-            // double-buffer between two surfaces every vblank, so the one the
-            // guest happens to be displaying is not the one it just drew:
-            // present whichever target received this frame's draws.
+            // Nothing drawn into the displayed surface: a menu double-buffering
+            // between two surfaces every vblank, so the one being displayed is
+            // not the one just drawn. Present whichever received the draws.
             std::uint32_t best = s.display_framebuffer;
             std::size_t best_count = 0u;
             for (const DrawBatch &candidate : s.batches) {
@@ -1450,6 +1463,7 @@ bool submit_color_frame(std::uint64_t vblank) noexcept {
     s.vertices.clear();
     s.batches.clear();
     s.frame_has_scene = false;
+    s.composited_last_frame = !world_batches.empty();
     if (selected.empty() || display_batches.empty() ||
         selected.size() * sizeof(GeGpuVertex) > kVertexCapacity) return false;
     // Menus are rendered here too. They used to be handed back to the software

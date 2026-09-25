@@ -7,6 +7,10 @@
 #include "psprecomp/common.hpp"
 
 #include <algorithm>
+#include <unordered_set>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 #include <atomic>
 #include <bit>
 #include <array>
@@ -3437,6 +3441,14 @@ Color gpu_texture_debug_color(const GeGpuDrawDescriptor &draw, Color lighting) n
             modulate(texture_color.b, lighting.b), 255u};
 }
 
+// Where the radar is moved from, in the 512x320 world target (the disc itself
+// spans x 8..87, y 225..312). Wider than the disc: the map is a square that
+// rotates with the camera, and its corners reach ~1.41 radii from the centre.
+constexpr float kRadarLeft = -28.0f, kRadarRight = 120.0f;
+constexpr float kRadarTop = 200.0f, kRadarBottom = 340.0f;
+// Moves the disc's top from y 225 to y 32, under the top-left help box.
+constexpr float kRadarShift = 32.0f - 225.0f;
+
 GeGpuDrawDescriptor gpu_effective_draw_descriptor(GeGpuDrawDescriptor draw) noexcept {
     if (!draw.clear_mode) return draw;
     draw.texture_enabled = false;
@@ -4851,6 +4863,33 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         ge_gpu_backend_note_through_extent(gpu_draw, max_x, max_y);
 
         const GeGpuWidescreenHud hud = ge_gpu_backend_widescreen_hud(gpu_draw);
+        // Radar to the top-left corner: on a phone the bottom-left one sits
+        // under the thumb and the joystick. Measured on the 512x320 world
+        // target: the disc spans x 8..87, y 225..312, its north marker and
+        // blips inside that, and the help box above it ends at y 25. Only the
+        // vertical position changes, so the widescreen pass below still pulls
+        // it in horizontally like the rest of the HUD. Gameplay frames only:
+        // menus share this target and have their own bottom-left items.
+        // Depth-tested draws included: the frame and markers of the radar are.
+        if (hud.gameplay_world && !setup.clear_mode) {
+            float min_y = vertices.front().y;
+            for (const Vertex &vertex : vertices) min_y = std::min(min_y, vertex.y);
+            // The map tiles overhang the radar and are cut to it by the
+            // scissor, so they are recognised by the clip rectangle instead.
+            const bool clipped_to_radar =
+                setup.scissor_x1 <= static_cast<std::int32_t>(kRadarRight) &&
+                setup.scissor_y0 >= static_cast<std::int32_t>(kRadarTop) &&
+                setup.scissor_y1 <= static_cast<std::int32_t>(kRadarBottom);
+            if (clipped_to_radar || (min_x >= kRadarLeft && max_x <= kRadarRight &&
+                                     min_y >= kRadarTop && max_y <= kRadarBottom)) {
+                for (Vertex &vertex : vertices) vertex.y += kRadarShift;
+                const auto shift = static_cast<std::int32_t>(kRadarShift);
+                setup.scissor_y0 = std::max(0, setup.scissor_y0 + shift);
+                setup.scissor_y1 = std::max(0, setup.scissor_y1 + shift);
+                gpu_draw.scissor_y0 = setup.scissor_y0;
+                gpu_draw.scissor_y1 = setup.scissor_y1;
+            }
+        }
         // Full-width draws are backdrops, fades and letterbox bars: they have to
         // keep covering the screen, so they stay stretched. Measured against the
         // real 480 px display, not against this target's own size.

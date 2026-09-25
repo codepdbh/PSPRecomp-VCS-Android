@@ -1,3 +1,6 @@
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 #include "psprecomp/runtime.hpp"
 #include "psprecomp/common.hpp"
 
@@ -1166,6 +1169,13 @@ void Runtime::invoke_import_cached(std::uint32_t slot, std::string_view library,
         if (slot >= import_bindings_.size()) import_bindings_.resize(static_cast<std::size_t>(slot) + 1u, nullptr);
         bound = &function_it->second;
         import_bindings_[slot] = bound;
+#if defined(__ANDROID__)
+        // First call through this import: which system services a scene touches
+        // is the first question when it hangs on a black screen.
+        __android_log_print(ANDROID_LOG_INFO, "VCSHle", "first use %.*s::%s",
+                            static_cast<int>(library.size()), library.data(),
+                            nids_.resolve(std::string(library), nid).value_or(hex32(nid)).c_str());
+#endif
     }
 
     (*bound)(*this, ctx);

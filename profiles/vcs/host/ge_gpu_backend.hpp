@@ -470,6 +470,9 @@ struct GeGpuWidescreenHud {
     // Target-to-display scale, so a caller can test a span against the real
     // 480 px screen width without knowing the target's size.
     float display_scale_x{1.0f};
+    // A 3D scene went into this draw's target this frame: gameplay with its
+    // HUD, not a menu. Valid even when shrink is 1.
+    bool gameplay_world{};
 };
 [[nodiscard]] GeGpuWidescreenHud ge_gpu_backend_widescreen_hud(
     const GeGpuDrawDescriptor &draw) noexcept;

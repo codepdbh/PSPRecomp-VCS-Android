@@ -24,12 +24,15 @@ import android.view.View;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.text.DateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 
@@ -42,6 +45,10 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
                                               boolean accelerate, boolean brake);
     private static native void nativeStartGame(String gameRoot, String appDataDirectory);
     private static native void nativeStopGame();
+    private static native String nativeSaveState(boolean save, String file);
+
+    private static final int STATE_SLOTS = 3;
+    private boolean stateBusy;
 
     private static final String CONFIG_FILE = "VCSNative.ini";
 
@@ -111,6 +118,9 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             }
             @Override public void onSettingsRequested() {
                 showSettingsDialog();
+            }
+            @Override public void onSaveStateRequested() {
+                showSaveStateDialog();
             }
             @Override public void onEditModeChanged(boolean editing) {
                 if (editing) statusView.setVisibility(View.GONE);
@@ -403,17 +413,70 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     private void showSettingsDialog() {
         controls.releaseAll();
-        String[] items = {"Resolución interna…", "Editar posición de controles", "Restablecer controles"};
+        String[] items = {"Guardado de estado…", "Resolución interna…",
+                          "Editar posición de controles", "Restablecer controles"};
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Ajustes")
             .setItems(items, (dialog, which) -> {
-                if (which == 0) showResolutionDialog();
-                else if (which == 1) controls.setEditMode(true);
+                if (which == 0) showSaveStateDialog();
+                else if (which == 1) showResolutionDialog();
+                else if (which == 2) controls.setEditMode(true);
                 else controls.resetLayout();
             })
             .setNegativeButton("Cerrar", null)
             .setOnDismissListener(d -> hideSystemBars())
             .show();
+    }
+
+    private File stateFile(int slot) {
+        return new File(new File(getFilesDir(), "savestates"), "slot" + slot + ".vcss");
+    }
+
+    /** Save states: the whole game at this instant, apart from the game's own saves. */
+    private void showSaveStateDialog() {
+        controls.releaseAll();
+        if (stateBusy) return;
+        DateFormat format = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT);
+        String[] items = new String[STATE_SLOTS];
+        for (int i = 0; i < STATE_SLOTS; ++i) {
+            File file = stateFile(i + 1);
+            items[i] = "Ranura " + (i + 1) + " — "
+                + (file.isFile() ? format.format(new Date(file.lastModified())) : "vacía");
+        }
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Guardado de estado")
+            .setItems(items, (dialog, which) -> showStateSlotDialog(which + 1))
+            .setNegativeButton("Cerrar", null)
+            .setOnDismissListener(d -> hideSystemBars())
+            .show();
+    }
+
+    private void showStateSlotDialog(int slot) {
+        File file = stateFile(slot);
+        AlertDialog.Builder builder = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Ranura " + slot)
+            .setMessage(file.isFile()
+                ? "Cargar vuelve al momento guardado; se pierde lo jugado desde entonces."
+                : "Ranura vacía.")
+            .setPositiveButton(file.isFile() ? "Sobrescribir" : "Guardar aquí",
+                (d, w) -> runStateOperation(true, file))
+            .setNegativeButton("Cancelar", null)
+            .setOnDismissListener(d -> hideSystemBars());
+        if (file.isFile()) builder.setNeutralButton("Cargar", (d, w) -> runStateOperation(false, file));
+        builder.show();
+    }
+
+    private void runStateOperation(boolean save, File file) {
+        stateBusy = true;
+        Toast.makeText(this, save ? "Guardando estado…" : "Cargando estado…", Toast.LENGTH_SHORT).show();
+        // The native side waits for the game's next frame, so not on the UI thread.
+        new Thread(() -> {
+            String message = nativeSaveState(save, file.getAbsolutePath());
+            runOnUiThread(() -> {
+                stateBusy = false;
+                Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
+            });
+        }, "VCSSaveState").start();
     }
 
     private void showResolutionDialog() {

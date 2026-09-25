@@ -184,7 +184,7 @@ bool AudioStreamDecoder::open(const std::filesystem::path &path, std::uint32_t s
         offset = body + size + (size & 1u);
     }
     static unsigned logged_opens = 0u;
-    const bool log_open = logged_opens < 24u;
+    const bool log_open = logged_opens < 400u;
     if (log_open) ++logged_opens;
     if (s.data_begin == 0u || block_align == 0u || file_channels == 0u || file_rate == 0u ||
         (!atrac3plus && format_tag != 0x0270u)) {

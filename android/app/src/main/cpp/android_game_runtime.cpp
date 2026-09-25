@@ -216,3 +216,16 @@ Java_com_psprecomp_vcs_MainActivity_nativeStopGame(JNIEnv *, jclass) {
     std::lock_guard lock(g_thread_mutex);
     if (g_game_thread.joinable()) g_game_thread.join();
 }
+
+// Save states. Blocks until the game thread has done it at its next vblank,
+// so Java calls it off the UI thread. Returns the message to show.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_psprecomp_vcs_MainActivity_nativeSaveState(JNIEnv *env, jclass, jboolean save,
+                                                    jstring file) {
+    std::string message;
+    if (g_runtime.load(std::memory_order_acquire) == nullptr)
+        message = "El juego no está en marcha";
+    else
+        (void)vcs::save_state_request(save == JNI_TRUE, java_string(env, file), message);
+    return env->NewStringUTF(message.c_str());
+}
