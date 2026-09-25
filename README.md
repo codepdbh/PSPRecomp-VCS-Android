@@ -10,10 +10,10 @@
   <img alt="C++20" src="https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white" />
   <img alt="Android ARM64 Vulkan" src="https://img.shields.io/badge/Android-ARM64%20%C2%B7%20Vulkan-3DDC84?logo=android&logoColor=white" />
   <img alt="Windows DirectX 12" src="https://img.shields.io/badge/Windows-DirectX%2012-0078D4?logo=windows&logoColor=white" />
-  <img alt="Estado beta" src="https://img.shields.io/badge/estado-beta%200.2.0-orange" />
+  <img alt="Estado beta" src="https://img.shields.io/badge/estado-beta%200.2.1-orange" />
 </p>
 
-> **Estado actual (beta 0.2.0):** el juego se juega en Android con render por GPU (Vulkan), en pantalla completa widescreen, con audio completo (incluidas las voces de las cinemáticas) y con guardado de estado. Todavía hay detalles pendientes (ver [Problemas conocidos](#problemas-conocidos)).
+> **Estado actual (beta 0.2.1):** el juego se juega en Android con render por GPU (Vulkan), en pantalla completa widescreen, con audio completo (incluidas las voces de las cinemáticas), cámara libre y guardado de estado. Todavía hay detalles pendientes (ver [Problemas conocidos](#problemas-conocidos)).
 
 ## El proyecto
 
@@ -67,6 +67,7 @@ Guarda el juego completo en el instante exacto —misión, cinemática, posició
 ### Ajustes (botón ⚙ en pantalla)
 
 - **Guardado de estado:** las mismas ranuras que el botón 💾.
+- **Sensibilidad de cámara:** de Baja a Máxima; se aplica al instante al arrastre, al joystick derecho y al stick del mando.
 - **Resolución interna:** Rendimiento (por debajo de HD, la más fluida), HD, Full HD o nativa de la pantalla. Se aplica al reiniciar la app.
 - **Editar posición de controles:** arrastra cada grupo de botones y ajusta su tamaño con − / +.
 - **Restablecer controles:** vuelve al diseño original.
@@ -76,8 +77,9 @@ La configuración avanzada vive en `VCSNative.ini`, dentro de los archivos priva
 ### Controles
 
 - **Táctil:** joystick flotante (aparece donde apoyas el pulgar), cruceta, △ ○ ✕ □, L, R, SELECT y START.
-- **Mando Bluetooth/USB:** A = ✕, B = ○, X = □, Y = △, L1/L2 = L, R1/R2 = R, Start, Select, cruceta y stick izquierdo.
-- **Teclado y ratón:** WASD para moverse (Alt para caminar), Espacio, Shift, F/Enter, Q/E, H, flechas, Esc (pausa) y Tab; clic izquierdo dispara, clic derecho apunta y el botón central mira atrás.
+- **Cámara táctil:** joystick derecho (el del ojo 👁, a la izquierda de △ ○ ✕ □) para girar la cámara; también se puede mirar arrastrando el dedo por cualquier zona libre de la pantalla.
+- **Mando Bluetooth/USB:** A = ✕, B = ○, X = □, Y = △, L1/L2 = L, R1/R2 = R, Start, Select, cruceta, stick izquierdo y stick derecho para la cámara.
+- **Teclado y ratón:** WASD para moverse (Alt para caminar), Espacio, Shift, F/Enter, Q/E, H, flechas, Esc (pausa) y Tab. El primer clic captura el ratón y desde entonces mueve la cámara, como en PC; clic izquierdo dispara, clic derecho apunta y el botón central mira atrás.
 
 Al usar un mando, un teclado o un ratón, los controles táctiles se ocultan; vuelven al tocar la pantalla.
 
@@ -88,7 +90,6 @@ El radar está arriba a la izquierda, donde no lo tapa el pulgar. Si el botón L
 - En resoluciones altas el juego no siempre llega a velocidad completa. Si va lento, baja a HD o a Rendimiento desde ⚙.
 - En algunos puntos (el icono de guardado del juego, el final de algunas misiones) la pantalla puede quedarse en negro. Se está investigando; mientras tanto, usa el guardado de estado antes de esos momentos para no perder avance.
 - Los videos de introducción se saltan (pantalla negra): falta el decodificador de video para Android.
-- El ratón todavía no mueve la cámara; sus botones sí funcionan.
 - El APK beta está firmado con una clave de depuración.
 
 ## Compilar

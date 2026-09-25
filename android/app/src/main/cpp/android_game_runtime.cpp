@@ -195,6 +195,16 @@ Java_com_psprecomp_vcs_MainActivity_nativeSetInput(JNIEnv *, jclass, jint button
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_psprecomp_vcs_MainActivity_nativeAddCameraMotion(JNIEnv *, jclass, jfloat dx, jfloat dy) {
+    vcs::display_window_add_camera_motion(dx, dy);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_psprecomp_vcs_MainActivity_nativeSetCameraStick(JNIEnv *, jclass, jint x, jint y) {
+    vcs::display_window_set_camera_stick(x, y);
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_psprecomp_vcs_MainActivity_nativeStartGame(JNIEnv *env, jclass,
         jstring root, jstring app_data) {
     std::lock_guard lock(g_thread_mutex);

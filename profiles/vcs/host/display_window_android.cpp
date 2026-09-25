@@ -1,4 +1,5 @@
 #include "display_window_android.hpp"
+#include "vcs_config.hpp"
 
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <atomic>
 #include <cstring>
 #include <exception>
@@ -19,6 +21,19 @@ namespace {
 std::mutex g_mutex;
 ANativeWindow *g_window{};
 HostInputState g_input{};
+float g_camera_dx{};
+float g_camera_dy{};
+int g_camera_stick_x{};
+int g_camera_stick_y{};
+
+// Same curve as the desktop mouse (display_window.cpp): proportional for small
+// motions, approaching the axis ceiling instead of slamming into it.
+int camera_response(float delta) {
+    const double sensitivity = static_cast<double>(vcs_configuration().controls.mouse_sensitivity);
+    const double scaled = std::abs(delta) * (sensitivity / 12.0);
+    const double magnitude = 127.0 * scaled / (scaled + 12.0);
+    return static_cast<int>(std::lround(delta < 0.0f ? -magnitude : magnitude));
+}
 std::atomic_bool g_first_frame{};
 
 // Geometry last applied to g_window; 0 forces a reset (new surface).
@@ -68,6 +83,18 @@ void display_window_set_surface(ANativeWindow *window) noexcept {
 void display_window_set_input(const HostInputState &input) noexcept {
     std::lock_guard lock(g_mutex);
     g_input = input;
+}
+
+void display_window_add_camera_motion(float dx, float dy) noexcept {
+    std::lock_guard lock(g_mutex);
+    g_camera_dx += dx;
+    g_camera_dy += dy;
+}
+
+void display_window_set_camera_stick(int x, int y) noexcept {
+    std::lock_guard lock(g_mutex);
+    g_camera_stick_x = std::clamp(x, -127, 127);
+    g_camera_stick_y = std::clamp(y, -127, 127);
 }
 
 bool display_window_enabled() { return true; }
@@ -120,7 +147,19 @@ void display_window_analog(std::uint8_t &x, std::uint8_t &y) {
 }
 HostInputState display_window_input() {
     std::lock_guard lock(g_mutex);
-    return g_input;
+    HostInputState input = g_input;
+    // The motion is drained here, once per poll, like the desktop's mouse.
+    input.camera_x = camera_response(g_camera_dx);
+    // Negated: screen Y grows downwards, and the game's axis looks up when
+    // positive. Pushing the finger or the mouse forward raises the view.
+    input.camera_y = camera_response(-g_camera_dy);
+    g_camera_dx = g_camera_dy = 0.0f;
+    if (g_camera_stick_x != 0 || g_camera_stick_y != 0) {
+        input.camera_x = g_camera_stick_x;
+        input.camera_y = g_camera_stick_y;
+    }
+    if (vcs_configuration().controls.invert_camera_y) input.camera_y = -input.camera_y;
+    return input;
 }
 bool display_window_close_requested() { return false; }
 void display_window_shutdown() {}

@@ -2,6 +2,7 @@ package com.psprecomp.vcs;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Context;
 import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
@@ -46,6 +47,21 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private static native void nativeStartGame(String gameRoot, String appDataDirectory);
     private static native void nativeStopGame();
     private static native String nativeSaveState(boolean save, String file);
+    private static native void nativeAddCameraMotion(float dx, float dy);
+    private static native void nativeSetCameraStick(int x, int y);
+
+    // Touch camera: screen pixels to the mouse counts the camera curve expects,
+    // scaled by density so a drag of the same length turns the same on any panel.
+    private static final float TOUCH_CAMERA_COUNTS_PER_DP = 4.0f;
+    private static final String[] CAMERA_SENSITIVITY_LABELS = {"Baja", "Media", "Alta", "Muy alta", "Máxima"};
+    // Drag distance multipliers; the sticks' full-speed point moves inwards
+    // with the same setting (see stickCameraValue).
+    private static final float[] CAMERA_SENSITIVITY_SCALES = {0.5f, 1f, 1.6f, 2.5f, 4f};
+    private int cameraSensitivity = 2;
+    // Camera stick from the touch right stick and from a controller, -127..127
+    // each; whichever is deflected further is sent.
+    private int touchCameraX, touchCameraY, padCameraX, padCameraY;
+    private int sentCameraX, sentCameraY;
 
     private static final int STATE_SLOTS = 3;
     private boolean stateBusy;
@@ -102,7 +118,25 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
+        cameraSensitivity = Math.max(0, Math.min(CAMERA_SENSITIVITY_SCALES.length - 1,
+            getSharedPreferences("controls", Context.MODE_PRIVATE).getInt("camera_sensitivity", 2)));
         surfaceView = new GameSurface();
+        // A mouse is captured on its first click, as on the desktop, and then
+        // its motion turns the camera instead of moving a pointer.
+        surfaceView.setFocusable(true);
+        surfaceView.setFocusableInTouchMode(true);
+        surfaceView.setOnCapturedPointerListener((view, event) -> {
+            float dx = 0f, dy = 0f;
+            for (int h = 0; h < event.getHistorySize(); ++h) {
+                dx += event.getHistoricalX(h);
+                dy += event.getHistoricalY(h);
+            }
+            dx += event.getX();
+            dy += event.getY();
+            if (dx != 0f || dy != 0f) nativeAddCameraMotion(dx, dy);
+            handleMouse(event);
+            return true;
+        });
         surfaceView.getHolder().setFormat(PixelFormat.RGBA_8888);
         surfaceView.getHolder().addCallback(this);
         root.addView(surfaceView, new FrameLayout.LayoutParams(
@@ -121,6 +155,16 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             }
             @Override public void onSaveStateRequested() {
                 showSaveStateDialog();
+            }
+            @Override public void onCameraMotion(float dx, float dy) {
+                float scale = TOUCH_CAMERA_COUNTS_PER_DP / getResources().getDisplayMetrics().density
+                    * CAMERA_SENSITIVITY_SCALES[cameraSensitivity];
+                nativeAddCameraMotion(dx * scale, dy * scale);
+            }
+            @Override public void onCameraStick(float x, float y) {
+                touchCameraX = stickCameraValue(x);
+                touchCameraY = stickCameraValue(y);
+                pushCamera();
             }
             @Override public void onEditModeChanged(boolean editing) {
                 if (editing) statusView.setVisibility(View.GONE);
@@ -172,6 +216,8 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         // Nothing may stay held while the app is in the background.
         padButtons = padHatButtons = keyboardButtons = mouseButtons = 0;
         padStickX = padStickY = 0f;
+        touchCameraX = touchCameraY = padCameraX = padCameraY = 0;
+        pushCamera();
         keyW = keyA = keyS = keyD = keyWalk = false;
         if (controls != null) controls.releaseAll();
         super.onPause();
@@ -325,6 +371,47 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         return super.dispatchKeyEvent(event);
     }
 
+    /**
+     * Right stick to camera. Most pads report it as Z/RZ, some as RX/RY; the
+     * larger deflection of the two pairs wins. Up is positive for the game.
+     */
+    private void updateCameraStick(MotionEvent event) {
+        float x = event.getAxisValue(MotionEvent.AXIS_Z), y = event.getAxisValue(MotionEvent.AXIS_RZ);
+        float rx = event.getAxisValue(MotionEvent.AXIS_RX), ry = event.getAxisValue(MotionEvent.AXIS_RY);
+        if (rx * rx + ry * ry > x * x + y * y) { x = rx; y = ry; }
+        float magnitude = (float) Math.sqrt(x * x + y * y);
+        int cx = 0, cy = 0;
+        if (magnitude > PAD_DEAD_ZONE) {
+            float scaled = Math.min(1f, (magnitude - PAD_DEAD_ZONE) / (1f - PAD_DEAD_ZONE));
+            cx = stickCameraValue(x / magnitude * scaled);
+            cy = stickCameraValue(-y / magnitude * scaled);
+            controls.hideForController();
+        }
+        padCameraX = cx;
+        padCameraY = cy;
+        pushCamera();
+    }
+
+    /**
+     * A stick deflection (-1..1) to the camera axis. Higher sensitivity reaches
+     * full turning speed with less of the stick's travel.
+     */
+    private int stickCameraValue(float deflection) {
+        float gain = 0.8f + 0.3f * cameraSensitivity; // 0.8 .. 2.0
+        return Math.max(-127, Math.min(127, Math.round(deflection * gain * 127f)));
+    }
+
+    private void pushCamera() {
+        boolean touchWins = touchCameraX * touchCameraX + touchCameraY * touchCameraY >=
+            padCameraX * padCameraX + padCameraY * padCameraY;
+        int x = touchWins ? touchCameraX : padCameraX;
+        int y = touchWins ? touchCameraY : padCameraY;
+        if (x == sentCameraX && y == sentCameraY) return;
+        sentCameraX = x;
+        sentCameraY = y;
+        nativeSetCameraStick(x, y);
+    }
+
     /** Mouse buttons follow the desktop host: fire left, aim right, look behind middle. */
     private boolean handleMouse(MotionEvent event) {
         int state = event.getButtonState();
@@ -332,7 +419,13 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         if ((state & MotionEvent.BUTTON_PRIMARY) != 0) buttons |= TouchControlsView.PSP_CIRCLE;
         if ((state & MotionEvent.BUTTON_SECONDARY) != 0) buttons |= TouchControlsView.PSP_R;
         if ((state & MotionEvent.BUTTON_TERTIARY) != 0) buttons |= TouchControlsView.PSP_L;
-        if (buttons != 0) controls.hideForController();
+        if (buttons != 0) {
+            controls.hideForController();
+            if (!surfaceView.hasPointerCapture()) {
+                surfaceView.requestFocus();
+                surfaceView.requestPointerCapture();
+            }
+        }
         if (buttons != mouseButtons) {
             mouseButtons = buttons;
             pushInput();
@@ -359,6 +452,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             event.getActionMasked() == MotionEvent.ACTION_MOVE && !controls.isEditing()) {
             padStickX = event.getAxisValue(MotionEvent.AXIS_X);
             padStickY = event.getAxisValue(MotionEvent.AXIS_Y);
+            updateCameraStick(event);
             // Many pads report the D-pad as a hat axis rather than as keys.
             float hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X);
             float hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y);
@@ -413,17 +507,34 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     private void showSettingsDialog() {
         controls.releaseAll();
-        String[] items = {"Guardado de estado…", "Resolución interna…",
+        String[] items = {"Guardado de estado…", "Resolución interna…", "Sensibilidad de cámara…",
                           "Editar posición de controles", "Restablecer controles"};
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Ajustes")
             .setItems(items, (dialog, which) -> {
                 if (which == 0) showSaveStateDialog();
                 else if (which == 1) showResolutionDialog();
-                else if (which == 2) controls.setEditMode(true);
+                else if (which == 2) showCameraSensitivityDialog();
+                else if (which == 3) controls.setEditMode(true);
                 else controls.resetLayout();
             })
             .setNegativeButton("Cerrar", null)
+            .setOnDismissListener(d -> hideSystemBars())
+            .show();
+    }
+
+    /** How far the camera turns per finger drag. Takes effect at once. */
+    private void showCameraSensitivityDialog() {
+        controls.releaseAll();
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Sensibilidad de cámara")
+            .setSingleChoiceItems(CAMERA_SENSITIVITY_LABELS, cameraSensitivity, (dialog, which) -> {
+                cameraSensitivity = which;
+                getSharedPreferences("controls", Context.MODE_PRIVATE).edit()
+                    .putInt("camera_sensitivity", which).apply();
+                dialog.dismiss();
+            })
+            .setNegativeButton("Cancelar", null)
             .setOnDismissListener(d -> hideSystemBars())
             .show();
     }

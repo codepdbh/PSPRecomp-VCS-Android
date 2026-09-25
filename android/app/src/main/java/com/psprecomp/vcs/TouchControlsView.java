@@ -45,6 +45,10 @@ final class TouchControlsView extends View {
         void onInput(int buttons, int analogX, int analogY, boolean accelerate, boolean brake);
         void onSettingsRequested();
         void onSaveStateRequested();
+        /** A finger dragged over free screen: turn the camera by this many pixels. */
+        void onCameraMotion(float dx, float dy);
+        /** The on-screen right stick: -1..1 each, up positive, 0 at rest. */
+        void onCameraStick(float x, float y);
         void onEditModeChanged(boolean editing);
     }
 
@@ -55,8 +59,8 @@ final class TouchControlsView extends View {
 
     // Groups move and scale as one unit in the editor.
     private static final int G_STICK = 0, G_DPAD = 1, G_FACE = 2, G_L = 3, G_R = 4,
-            G_SELECT = 5, G_START = 6, G_COUNT = 7;
-    private static final String[] GROUP_KEYS = {"stick", "dpad", "face", "l", "r", "select", "start"};
+            G_SELECT = 5, G_START = 6, G_CAMERA = 7, G_COUNT = 8;
+    private static final String[] GROUP_KEYS = {"stick", "dpad", "face", "l", "r", "select", "start", "camera"};
     private static final float MIN_SCALE = 0.6f, MAX_SCALE = 1.8f, SCALE_STEP = 0.1f;
 
     private static final class Control {
@@ -143,6 +147,19 @@ final class TouchControlsView extends View {
     private int stickPointer = -1;
     private float stickX, stickY; // -1..1 after dead zone
     private static final float DEAD_ZONE = 0.12f;
+
+    // Camera: any finger that lands on free screen, away from the buttons and
+    // the stick's zone, looks around while it moves, like a mouse.
+    private int cameraPointer = -1;
+    private float cameraLastX, cameraLastY;
+
+    // Right stick: the camera as a joystick. Floating like the left one, in a
+    // zone left of the face buttons; its deflection is a turn rate.
+    private final RectF camZone = new RectF();
+    private final PointF camHome = new PointF(), camBase = new PointF(), camKnob = new PointF();
+    private float camRadius, camKnobRadius;
+    private int camPointer = -1;
+    private float camX, camY;
 
     // Layout customisation: offsets are fractions of the screen, scale is relative.
     private final float[] groupDx = new float[G_COUNT];
@@ -318,6 +335,26 @@ final class TouchControlsView extends View {
         if (stickPointer == -1) {
             stickBase.set(stickHome);
             stickKnob.set(stickHome);
+        }
+
+        // Right (camera) stick: left of the face buttons, as low as the left stick.
+        float defaultCamRadius = unit * 0.13f;
+        RectF face = groupBounds[G_FACE];
+        float camHomeX = faceCx - spread - faceR - margin * 1.2f - defaultCamRadius;
+        float camHomeY = bottom - margin - defaultCamRadius * 1.1f;
+        camRadius = defaultCamRadius * groupScale[G_CAMERA];
+        camKnobRadius = camRadius * 0.46f;
+        camHome.set(camHomeX + groupDx[G_CAMERA] * w, camHomeY + groupDy[G_CAMERA] * h);
+        groupBounds[G_CAMERA].set(camHome.x - camRadius, camHome.y - camRadius,
+                                  camHome.x + camRadius, camHome.y + camRadius);
+        camZone.set(camHome.x - camRadius * 1.8f, camHome.y - camRadius * 2.0f,
+                    camHome.x + camRadius * 1.8f, camHome.y + camRadius * 2.0f);
+        camZone.intersect((left + right) / 2f, top + (bottom - top) * 0.22f, right, bottom);
+        if (RectF.intersects(camZone, face) && face.left > camHome.x)
+            camZone.right = Math.max(camHome.x + camRadius, face.left - faceR * 0.2f);
+        if (camPointer == -1) {
+            camBase.set(camHome);
+            camKnob.set(camHome);
         }
 
         // Editor toolbar, centre of the screen.
@@ -510,12 +547,37 @@ final class TouchControlsView extends View {
             float by = Math.max(safeTop + stickRadius, Math.min(y, getHeight() - safeBottom - stickRadius));
             stickBase.set(bx, by);
             updateStick(x, y);
+            return;
+        }
+        if (camPointer == -1 && camZone.contains(x, y)) {
+            camPointer = id;
+            float bx = Math.max(safeLeft + camRadius, Math.min(x, getWidth() - safeRight - camRadius));
+            float by = Math.max(safeTop + camRadius, Math.min(y, getHeight() - safeBottom - camRadius));
+            camBase.set(bx, by);
+            updateCamStick(x, y);
+            return;
+        }
+        if (cameraPointer == -1) {
+            cameraPointer = id;
+            cameraLastX = x;
+            cameraLastY = y;
         }
     }
 
     private void move(int id, float x, float y) {
         if (id == stickPointer) {
             updateStick(x, y);
+            return;
+        }
+        if (id == camPointer) {
+            updateCamStick(x, y);
+            return;
+        }
+        if (id == cameraPointer) {
+            float dx = x - cameraLastX, dy = y - cameraLastY;
+            cameraLastX = x;
+            cameraLastY = y;
+            if (dx != 0f || dy != 0f) listener.onCameraMotion(dx, dy);
             return;
         }
         for (Control c : controls) {
@@ -534,6 +596,8 @@ final class TouchControlsView extends View {
     }
 
     private void up(int id) {
+        if (id == cameraPointer) cameraPointer = -1;
+        if (id == camPointer) releaseCamStick();
         if (id == stickPointer) {
             stickPointer = -1;
             stickX = stickY = 0f;
@@ -549,6 +613,8 @@ final class TouchControlsView extends View {
     }
 
     void releaseAll() {
+        cameraPointer = -1;
+        releaseCamStick();
         stickPointer = -1;
         stickX = stickY = 0f;
         stickBase.set(stickHome);
@@ -579,6 +645,35 @@ final class TouchControlsView extends View {
             stickX = dx / distance * scaled;
             stickY = dy / distance * scaled;
         }
+    }
+
+    private void releaseCamStick() {
+        boolean wasActive = camPointer != -1 || camX != 0f || camY != 0f;
+        camPointer = -1;
+        camX = camY = 0f;
+        camBase.set(camHome);
+        camKnob.set(camHome);
+        if (wasActive) listener.onCameraStick(0f, 0f);
+    }
+
+    private void updateCamStick(float x, float y) {
+        float dx = x - camBase.x, dy = y - camBase.y;
+        float distance = (float) Math.sqrt(dx * dx + dy * dy);
+        if (distance > camRadius) {
+            dx = dx / distance * camRadius;
+            dy = dy / distance * camRadius;
+            distance = camRadius;
+        }
+        camKnob.set(camBase.x + dx, camBase.y + dy);
+        float magnitude = distance / camRadius;
+        if (magnitude < DEAD_ZONE || distance <= 0f) {
+            camX = camY = 0f;
+        } else {
+            float scaled = (magnitude - DEAD_ZONE) / (1f - DEAD_ZONE);
+            camX = dx / distance * scaled;
+            camY = dy / distance * scaled;
+        }
+        listener.onCameraStick(camX, -camY);
     }
 
     private void publish() {
@@ -649,7 +744,19 @@ final class TouchControlsView extends View {
     }
 
     private void drawStick(Canvas canvas) {
-        boolean active = stickPointer != -1;
+        drawStick(canvas, stickBase, stickKnob, stickRadius, knobRadius, stickPointer != -1);
+        drawStick(canvas, camBase, camKnob, camRadius, camKnobRadius, camPointer != -1);
+        // Eye mark on the right stick's knob, so the two sticks read apart.
+        stroke.setColor(0x99000000);
+        stroke.setStrokeWidth(Math.max(2f, camKnobRadius * 0.10f));
+        float r = camKnobRadius * 0.42f;
+        canvas.drawOval(camKnob.x - r, camKnob.y - r * 0.62f, camKnob.x + r, camKnob.y + r * 0.62f, stroke);
+        fill.setColor(0x99000000);
+        canvas.drawCircle(camKnob.x, camKnob.y, r * 0.30f, fill);
+    }
+
+    private void drawStick(Canvas canvas, PointF stickBase, PointF stickKnob, float stickRadius,
+                           float knobRadius, boolean active) {
         fill.setStyle(Paint.Style.FILL);
         fill.setColor(0x401C1C22);
         canvas.drawCircle(stickBase.x, stickBase.y, stickRadius, fill);
