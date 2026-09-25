@@ -179,8 +179,28 @@ if(ANDROID)
         "${VCS_PROFILE_DIR}/host"
         "${VCS_PROFILE_DIR}/generated"
         "${VCS_PROFILE_DIR}/third_party/ffmpeg/include"
+        "${VCS_PROFILE_DIR}/third_party/at3_standalone"
     )
-    target_link_libraries(vcs_guest_core PRIVATE psprecomp_core ${CMAKE_DL_LIBS} android log aaudio vulkan)
+    # ATRAC3/ATRAC3+ decoding for the media HLE (vcs_media_decoder_android.cpp):
+    # PPSSPP's standalone extraction of FFmpeg's decoders, LGPL 2.1+. The
+    # desktop build gets the same codecs from its FFmpeg libraries instead.
+    set(VCS_AT3_DIR "${VCS_PROFILE_DIR}/third_party/at3_standalone")
+    add_library(vcs_at3_standalone STATIC
+        "${VCS_AT3_DIR}/atrac.cpp"
+        "${VCS_AT3_DIR}/atrac3.cpp"
+        "${VCS_AT3_DIR}/atrac3plus.cpp"
+        "${VCS_AT3_DIR}/atrac3plusdec.cpp"
+        "${VCS_AT3_DIR}/atrac3plusdsp.cpp"
+        "${VCS_AT3_DIR}/get_bits.cpp"
+        "${VCS_AT3_DIR}/compat.cpp"
+        "${VCS_AT3_DIR}/fft.cpp"
+        "${VCS_AT3_DIR}/mem.cpp")
+    target_include_directories(vcs_at3_standalone PRIVATE "${VCS_AT3_DIR}")
+    target_compile_options(vcs_at3_standalone PRIVATE -O2 -w)
+    target_link_libraries(vcs_at3_standalone PRIVATE log)
+    set_target_properties(vcs_at3_standalone PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(vcs_guest_core PRIVATE psprecomp_core vcs_at3_standalone ${CMAKE_DL_LIBS}
+                          android log aaudio vulkan)
     set_target_properties(vcs_guest_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
     return()
 endif()

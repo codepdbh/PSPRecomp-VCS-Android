@@ -6,6 +6,7 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <array>
 #include <cstddef>
@@ -58,6 +59,9 @@ struct Texture {
     VkDescriptorSet descriptor{VK_NULL_HANDLE};
     Buffer staging{};
     bool pending{};
+    // Its upload has been recorded into a submitted frame; the staging buffer
+    // can go once that frame's fence has signalled.
+    bool recorded{};
 };
 
 struct VulkanPreview {
@@ -70,6 +74,12 @@ struct VulkanPreview {
     // vblank, one of which is the gameplay world target, so the address alone
     // cannot tell a menu frame from a gameplay one.
     bool frame_has_scene{};
+    // A frame submitted but not yet collected. The CPU no longer waits for the
+    // GPU right after submitting: it goes on emulating the next vblank while
+    // the GPU draws, and collects the result at the start of the next frame.
+    bool frame_in_flight{};
+    bool fence_waited{};
+    std::uint64_t in_flight_vblank{};
     unsigned consecutive_2d_frames{};
     VkInstance instance{VK_NULL_HANDLE};
     VkPhysicalDevice physical{VK_NULL_HANDLE};
@@ -841,7 +851,8 @@ bool create_texture(VulkanPreview &s, std::uint32_t width, std::uint32_t height,
 
 void record_texture_uploads(VulkanPreview &s) {
     for (auto &[key, texture] : s.textures) {
-        if (!texture.pending) continue;
+        if (!texture.pending || texture.recorded) continue;
+        texture.recorded = true;
         VkImageMemoryBarrier before{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         before.srcAccessMask = 0u;
         before.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1078,6 +1089,8 @@ bool ge_gpu_backend_upload_decoded_texture_chain(const GeGpuDrawDescriptor &draw
     return ge_gpu_backend_upload_decoded_texture(draw, levels.front().width,
                                                  levels.front().height, levels.front().rgba8);
 }
+void wait_in_flight(VulkanPreview &s);  // defined with the frame submission below
+
 bool ge_gpu_backend_upload_decoded_texture_chain_packed(const GeGpuDrawDescriptor &draw,
     std::uint32_t width, std::uint32_t height, std::uint32_t,
     std::vector<std::byte> rgba) noexcept {
@@ -1117,6 +1130,7 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(const GeGpuDrawDescripto
             return false;
         }
         s.texture_bytes -= victim->second.bytes;
+        wait_in_flight(s);  // the frame in flight may still sample it
         destroy_texture(s, victim->second);
         s.textures.erase(victim);
         ++s.report.evicted_textures;
@@ -1146,6 +1160,7 @@ bool ge_gpu_backend_upload_decoded_texture_chain_packed(const GeGpuDrawDescripto
             ++s.report.unique_texture_image_keys;
         } else {
             s.texture_bytes -= found->second.bytes;
+            wait_in_flight(s);
             destroy_texture(s, found->second);
             found->second = texture;
             s.texture_bytes += base_bytes;
@@ -1254,7 +1269,65 @@ void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept {
     s.display_framebuffer = masked;
 }
 
+// Frame-time breakdown, logged every 120 vblanks with the extent diagnostics.
+struct FrameTiming {
+    std::uint64_t finish_ns{}, wait_ns{}, copy_ns{}, frames{};
+};
+FrameTiming g_frame_timing;
+std::uint64_t steady_ns() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// Blocks until the frame in flight (if any) has finished on the GPU. Needed
+// before anything it may still be reading is destroyed or overwritten.
+void wait_in_flight(VulkanPreview &s) {
+    if (!s.frame_in_flight || s.fence_waited) return;
+    const std::uint64_t wait_start = steady_ns();
+    const VkResult result = vkWaitForFences(s.device, 1u, &s.fence, VK_TRUE, 2'000'000'000ull);
+    g_frame_timing.wait_ns += steady_ns() - wait_start;
+    if (result != VK_SUCCESS) log_error("vkWaitForFences", result);
+    s.fence_waited = true;
+}
+
+// Collects the frame in flight: frees the staging buffers its uploads used and
+// copies its readback out. Returns true when a finished frame is now available.
+bool collect_in_flight(VulkanPreview &s) {
+    if (!s.frame_in_flight) return false;
+    wait_in_flight(s);
+    for (auto &[key, texture] : s.textures) {
+        if (!texture.pending || !texture.recorded) continue;
+        destroy_buffer(s, texture.staging);
+        texture.pending = false;
+        texture.recorded = false;
+    }
+    const std::uint64_t copy_start = steady_ns();
+    std::memcpy(s.frame_rgba.data(), s.readback.mapped, s.frame_rgba.size());
+    g_frame_timing.copy_ns += steady_ns() - copy_start;
+    ++s.report.game_frames;
+    s.report.game_frame_readback_bytes = s.frame_rgba.size();
+    s.report.game_frame_vblank = s.in_flight_vblank;
+    s.frame_in_flight = false;
+    return true;
+}
+
+bool submit_color_frame(std::uint64_t vblank) noexcept;
+
 bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
+    VulkanPreview &s = state();
+    // The previous frame has had a whole vblank of emulation to finish on the
+    // GPU; collect it now, then submit this one without waiting for it.
+    const bool frame_ready = s.enabled && collect_in_flight(s);
+    (void)submit_color_frame(vblank);
+    return frame_ready;
+}
+
+bool submit_color_frame(std::uint64_t vblank) noexcept {
+    const std::uint64_t finish_start = steady_ns();
+    struct FinishTimer {
+        std::uint64_t start;
+        ~FinishTimer() { g_frame_timing.finish_ns += steady_ns() - start; ++g_frame_timing.frames; }
+    } finish_timer{finish_start};
     VulkanPreview &s = state();
     s.report.software_fallback_frame = s.software_menu_active;
     if (!s.enabled || s.batches.empty()) {
@@ -1322,6 +1395,13 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             d.feedback_texture_width, d.feedback_texture_height,
             d.feedback_max_u, d.feedback_max_v, d.feedback_max_x, d.feedback_max_y);
         g_extent_diag = {};
+        const FrameTiming &t = g_frame_timing;
+        if (t.frames != 0u)
+            __android_log_print(ANDROID_LOG_INFO, "VCSVulkan",
+                "timing per GPU frame: finish=%.2fms (gpu wait=%.2fms, readback copy=%.2fms) over %llu frames",
+                t.finish_ns / 1e6 / t.frames, t.wait_ns / 1e6 / t.frames, t.copy_ns / 1e6 / t.frames,
+                static_cast<unsigned long long>(t.frames));
+        g_frame_timing = {};
     }
     std::vector<GeGpuVertex> selected;
     std::vector<DrawBatch> world_batches;
@@ -1566,17 +1646,9 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     submit.pCommandBuffers = &s.command;
     result = vkQueueSubmit(s.queue, 1u, &submit, s.fence);
     if (result != VK_SUCCESS) { log_error("vkQueueSubmit", result); return false; }
-    result = vkWaitForFences(s.device, 1u, &s.fence, VK_TRUE, 2'000'000'000ull);
-    if (result != VK_SUCCESS) { log_error("vkWaitForFences", result); return false; }
-    for (auto &[key, texture] : s.textures) {
-        if (!texture.pending) continue;
-        destroy_buffer(s, texture.staging);
-        texture.pending = false;
-    }
-    std::memcpy(s.frame_rgba.data(), s.readback.mapped, s.frame_rgba.size());
-    ++s.report.game_frames;
-    s.report.game_frame_readback_bytes = s.frame_rgba.size();
-    s.report.game_frame_vblank = vblank;
+    s.frame_in_flight = true;
+    s.fence_waited = false;
+    s.in_flight_vblank = vblank;
     // VulkanPreview is an explicit visual-inspection mode. The software GE is
     // still updating PSP memory, so a failed or missing GPU frame can fall
     // back to that reference image without losing game state.

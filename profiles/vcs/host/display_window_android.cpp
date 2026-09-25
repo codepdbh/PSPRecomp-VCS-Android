@@ -5,6 +5,7 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cstring>
 #include <exception>
@@ -93,8 +94,20 @@ void display_window_present(const psprecomp::GuestMemory &memory,
 void display_window_present_rgba(std::span<const std::byte> rgba,
                                  std::uint32_t width, std::uint32_t height) {
     if (rgba.size() < static_cast<std::size_t>(width) * height * 4u) return;
-    std::lock_guard lock(g_mutex);
-    present_rgba_locked(rgba.data(), width, height);
+    const auto start = std::chrono::steady_clock::now();
+    {
+        std::lock_guard lock(g_mutex);
+        present_rgba_locked(rgba.data(), width, height);
+    }
+    // Time spent handing the frame to the window, logged every 120 presents.
+    static std::uint64_t total_ns = 0u, count = 0u;
+    total_ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count());
+    if (++count == 120u) {
+        __android_log_print(ANDROID_LOG_INFO, "VCSAndroid", "window present %.2fms avg (%ux%u)",
+                            total_ns / 1e6 / count, width, height);
+        total_ns = count = 0u;
+    }
 }
 
 std::uint32_t display_window_buttons() {

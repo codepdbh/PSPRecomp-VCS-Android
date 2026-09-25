@@ -389,6 +389,9 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     private List<ResolutionChoice> resolutionChoices() {
         List<ResolutionChoice> choices = new ArrayList<>();
+        // Below HD: twice the PSP's own height, for the smoothest frame rate.
+        choices.add(new ResolutionChoice(String.format(Locale.ROOT,
+            "Rendimiento — %d×544 (más fluido)", widescreenWidth(544)), "Scale", 2));
         choices.add(new ResolutionChoice(String.format(Locale.ROOT, "HD — %d×816", widescreenWidth(816)),
             "Scale", 3));
         choices.add(new ResolutionChoice(String.format(Locale.ROOT, "Full HD — %d×1088", widescreenWidth(1088)),
